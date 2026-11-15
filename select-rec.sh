@@ -2,7 +2,7 @@
 # Test aid: in a skirmish, record the brightness of the fortress area while selecting/deselecting it three times.
 . "$(dirname "$0")/env.sh"
 "$T/enter-skirmish.sh" >/dev/null 2>&1
-read -r W H <<< "$(tr -d '\r' < "$G/letterbox.log" | sed -n 's/^letterbox on: game \([0-9]*\)x\([0-9]*\) .*/\1 \2/p' | tail -1)"
+read -r W H <<< "$(game_size)"
 F=${1:-120}     # frames per second, for the waits
 fx=$((W*49/100)); fy=$((H*47/100)); gx=$((W*80/100)); gy=$((H*25/100))
 rm -f "${G:?}/letterbox.rec"

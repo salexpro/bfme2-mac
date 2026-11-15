@@ -2,7 +2,7 @@
 # Test aid: in a skirmish select a starting builder and record the brightness around it (the selection ring's throb).
 . "$(dirname "$0")/env.sh"
 "$T/enter-skirmish.sh" >/dev/null 2>&1
-read -r W H <<< "$(tr -d '\r' < "$G/letterbox.log" | sed -n 's/^letterbox on: game \([0-9]*\)x\([0-9]*\) .*/\1 \2/p' | tail -1)"
+read -r W H <<< "$(game_size)"
 F=${1:-120}
 bx=$((W*${BX:-6400}/10000)); by=$((H*${BY:-6250}/10000))
 rm -f "${G:?}/letterbox.rec"

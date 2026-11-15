@@ -15,3 +15,9 @@ G="$BFME_GAME"; CD="$BFME_COMPAT"; URL="$BFME_URL"
 need_steam() {   # for the scripts that start the game through Steam
   [ -n "$CD" ] && [ -n "$URL" ] || { echo "BFME_COMPAT and BFME_URL are not set (see env.sh)" >&2; exit 1; }
 }
+game_up() {     # wait (up to $1 s, default 90) until the game has created its Direct3D device; the proxy logs that
+  local i; for i in $(seq 1 "${1:-90}"); do grep -q "^CreateDevice: game" "$G/letterbox.log" 2>/dev/null && return 0; sleep 1; done; return 1
+}
+game_size() {   # prints "W H": the game's resolution (logged whether the picture is letterboxed or fills the screen)
+  tr -d '\r' < "$G/letterbox.log" 2>/dev/null | sed -n 's/^CreateDevice: game \([0-9]*\)x\([0-9]*\) .*/\1 \2/p' | tail -1
+}
