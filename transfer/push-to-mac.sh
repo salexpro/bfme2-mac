@@ -33,6 +33,13 @@ files)
       --exclude './sage-unlocked/source-fexfix' --exclude './sage-unlocked/source-fexfix2' --exclude './sage-unlocked/source-fexfix3' \
       -cf - . | $S "$DEST" "tar -C $(q "$RT") -xf -" || exit 1
   [ -f "$ICON" ] && cat "$ICON" | $S "$DEST" "cat > $(q "$RT/shortcut-icon.png")"
+  # the art and HUD set for the other Mac's display, built here (it may have no uv) and sent along
+  read -r rw rh _ <<< "$($S "$DEST" "$(q "$RT/bfme2-fex.sh") --selftest" | sed -n '1s/.*->  *//p')"
+  if [ -n "${rh:-}" ] && [ "$rh" -gt 0 ] 2>/dev/null; then
+    k=$(( rw * 1000 / rh )); if [ "$k" -ge 1765 ] && [ "$k" -le 1790 ]; then key=16x9; else key="a$k"; fi
+    [ -f "$TOOLS/widescreen-art/out/$key/!widescreen-art.big" ] || uv run -q --with pillow python "$TOOLS/widescreen-art/make-art.py" "$SRC_GAME" "$TOOLS/widescreen-art/out/$key" "$rw/$rh"
+    [ -d "$TOOLS/widescreen-art/out/$key" ] && tar -C "$TOOLS" -cf - "widescreen-art/out/$key" | $S "$DEST" "tar -C $(q "$RT") -xf -" && echo "art set $key (${rw}x${rh}) sent"
+  fi
   printf 'BFME_GAME="%s"\nBFME_COMPAT="%s"\nBFME_URL="steam://rungameid/%s"\n' "$RGAME" "$RSTEAM/steamapps/compatdata/$APPID" "$GAMEID" \
     | $S "$DEST" "cat > $(q "$RT/local.conf")"                  # settings for the test scripts over there
   $S "$DEST" "du -sh $(q "$RGAME") | cut -f1; ls $(q "$RT"); xattr -dr com.apple.quarantine $(q "$RT") 2>/dev/null; true"

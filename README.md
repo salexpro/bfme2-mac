@@ -11,7 +11,8 @@ No game files are included. You need your own installation of the game.
 | Problem on a Mac | What happens here |
 |---|---|
 | The game switches the display mode for its resolution (stretched picture; on some Mac + monitor combinations a mode switch can even crash the machine) | `letterbox/d3d9.dll` creates the real Direct3D device at the current desktop mode and fits the game's picture inside it with black bars. The display mode is never changed. |
-| Resolution has to be picked by hand per screen | The launch wrapper measures the main display at every start and sets a 16:9 resolution, the frame-rate cap and (on MacBooks) the notch offset. |
+| Resolution has to be picked by hand per screen | The launch wrapper measures the main display at every start and sets the resolution (the display's own shape between 4:3 and 16:9, 16:9 on anything wider), the frame-rate cap and (on MacBooks) the notch offset. Plug in another monitor and the next start follows it. |
+| The patch's HUD is right only at exactly 16:9; on a MacBook's 16:10 the minimap is an oval, so you play 16:9 with bars | `widescreen-art/hud.py` computes the HUD files for any shape between 4:3 and 16:9 from the game's original and the patch's 16:9 copies. A MacBook uses its whole screen below the camera housing, with a round minimap. |
 | Units are invisible (health bars and rings without models) | The game's prefix needs Microsoft's `d3dx9_27.dll`; `transfer/setup-prefix.sh` puts it in place. |
 | Scrolling and minimap jumps freeze for up to seconds | The terrain's mip-maps are built by a fast filter instead of D3DX (32 ms → 0.13 ms per tile); a camera jump bakes its tiles over a few frames. |
 | Locked to 30 fps | A patched build of [SAGE Unlocked](https://github.com/TheeHorse/SAGE-Unlocked) (`sage-unlocked/`) runs the game at the display's refresh rate with game logic at its normal 5 ticks per second. |
@@ -44,7 +45,8 @@ options-template.ini    first Options.ini for a new prefix
 letterbox/              the d3d9.dll proxy: letterbox.c, letterbox.ini (all settings, commented), build.sh
 sage-unlocked/          SAGE Unlocked v1.9.6 source, the patched Unlocker.cs, bfme2-fex.patch, build.sh
 transfer/               prefix-setup.reg, setup-prefix.sh (prepare a prefix), push-to-mac.sh (copy to another Mac)
-widescreen-art/         make-art.py (16:9 logo / loading screen overrides from your own files), loading-screen/ (see above)
+widescreen-art/         make-art.py (logo, loading screen and HUD overrides per picture shape, from your own files),
+                        hud.py (the HUD for any shape), loading-screen/ (see above)
 env.sh, *.sh in the root   test aids that drive the game through the proxy (see below)
 ```
 
@@ -62,7 +64,11 @@ env.sh, *.sh in the root   test aids that drive the game through the proxy (see 
    instead; close it.
 6. Run `transfer/setup-prefix.sh <shortcut appid> <serial> [game folder]`. It imports `prefix-setup.reg`, installs
    `d3dx9_27.dll` and links `C:\BFME2` to the game folder.
-7. Optional: `uv run --with pillow python widescreen-art/make-art.py <game folder> widescreen-art/out`.
+7. Art and HUD sets are kept per picture shape in `widescreen-art/out/<shape>/` (`16x9`, `a1594` for 1728x1084, ...).
+   The wrapper builds a missing one at start when `uv` is installed; by hand:
+   `uv run --with pillow python widescreen-art/make-art.py <game folder> widescreen-art/out/16x9` or, for another
+   shape, `... widescreen-art/out/a1594 1728/1084`. Without a set for a shape other than 16:9 the wrapper uses a 16:9
+   picture. An empty file `widescreen-art/disabled` goes without the art.
 8. Start the game from Steam.
 
 `transfer/push-to-mac.sh` does steps 4-6 on a second Mac over SSH.

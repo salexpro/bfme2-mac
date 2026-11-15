@@ -23,3 +23,4 @@ dgvoodoo-override.reg
 fex-game.reg
 .DS_Store
 sage-unlocked/source-fexfix4/*.diff
+__pycache__/

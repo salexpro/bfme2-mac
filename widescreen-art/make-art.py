@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Build the 16:9 art overrides for BFME II from the user's own game files (nothing from the game is shipped here).
+"""Build the widescreen art and HUD overrides for BFME II from the user's own game files (nothing from the game is
+shipped here), for one picture shape. The launch wrapper keeps one output folder per shape (out/16x9, out/a1594, ...)
+and installs the one that matches the display at every start.
 
     uv run --with pillow python make-art.py <game folder> <output folder> [aspect, default 16/9] [language, default english]
     uv run --with pillow python make-art.py --extract <name inside the archives> <game folder> <output file>
@@ -12,10 +14,15 @@ Writes into the output folder:
                         layout over a wide picture.
   root/<language>splash.jpg   only if custom/<language>splash.jpg exists: an enhanced copy, same size, of the small
                         picture shown before the game starts.
-A finished wide loading screen can be supplied as custom/load_w_ea-16x9.png (see loading-screen/).
+A finished wide loading screen can be supplied as custom/load_w_ea-16x9.png (see loading-screen/); for a shape
+narrower than 16:9 its middle is used.
+For shapes other than 16:9 the archive also gets the in-game HUD files for that shape (see hud.py); at 16:9 the patch's
+own are right.
 """
 import io, os, shutil, struct, sys
 from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hud
 
 def big_entries(path):
     with open(path, 'rb') as f:
@@ -49,6 +56,36 @@ def find_effective(game, wanted, language='english'):
                     with open(os.path.join(lang, b), 'rb') as f:
                         f.seek(off); hit = (name, f.read(size), 'lang/' + b)
     return hit if hit[1] else find_in_bigs(game, wanted)
+
+def read_big(path, wanted):
+    norm = lambda n: n.lower().replace('/', '\\')            # the original archives use /, the patch's use \
+    for name, off, size in big_entries(path):
+        if norm(name) == norm(wanted):
+            with open(path, 'rb') as f:
+                f.seek(off); return f.read(size)
+    return None
+
+def hud_files(game, aspect):
+    """the HUD files for this shape: [(name in the archive, bytes)]; nothing at 16:9 or without the patch's 16:9 HUD"""
+    res = []
+    if abs(hud.squeeze(aspect) - 0.75) < 0.004 or not 4 / 3 - 0.01 <= aspect <= 16 / 9 + 0.01: return res
+    for base in hud.FILES:
+        src = os.path.join(game, 'apt', base.lower() + '.big')
+        name, wide, where = find_in_bigs(game, base + '.apt')              # the patch's 16:9 copy (a root archive)
+        if not wide or not os.path.exists(src): print('HUD: no 16:9 copy of %s.apt, left as it is' % base); continue
+        orig, const = read_big(src, base + '.apt'), read_big(src, base + '.const')
+        try: blob, moved, skipped = hud.apt_for(orig, const, wide, aspect)
+        except Exception as e: print('HUD: %s.apt not understood (%s), left as it is' % (base, e)); continue
+        res.append((name, blob)); print('HUD: %s.apt for this shape (%d numbers moved, from %s)' % (base, moved, where))
+        # geometry files the patch changed for this movie
+        for b in sorted(x for x in os.listdir(game) if x.lower().endswith('.big') and not x.startswith('!widescreen')):
+            for gname, off, size in big_entries(os.path.join(game, b)):
+                if gname.lower().startswith(base.lower() + '_geometry\\'):
+                    o = read_big(src, gname); w = read_big(os.path.join(game, b), gname)
+                    if o and w and gname.lower() not in [n.lower() for n, _ in res]:
+                        try: res.append((gname, hud.ru_for(o, w, aspect)))
+                        except Exception as e: print('HUD: %s not understood (%s)' % (gname, e))
+    return res
 
 def write_big(path, files):
     table = b''; data = b''; first = 16 + sum(8 + len(n.encode('latin1')) + 1 for n, _ in files)
@@ -89,8 +126,10 @@ def main():
             # custom/<name>-16x9.png next to this script: a finished wide version of that picture (see loading-screen/).
             # It fills the whole screen; without one the original is squeezed and gets black sides.
             custom = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'custom', os.path.splitext(wanted.split('\\')[-1])[0] + '-16x9.png')
-            if os.path.exists(custom) and abs(aspect - 16 / 9) < 0.02 and w == h:
+            if os.path.exists(custom) and aspect <= 16 / 9 + 0.02 and w == h:
                 c = Image.open(custom).convert('RGB')
+                cw = min(c.width, round(c.height * aspect))                                        # narrower shape: the middle
+                c = c.crop(((c.width - cw) // 2, 0, (c.width - cw) // 2 + cw, c.height))
                 size = int(os.environ.get('BFME_ART_SIZE', 2048 if c.height >= 1536 else 1024))    # texture edge, power of two
                 canvas = Image.new('RGB', (size, size), (0, 0, 0))                                 # picture = top three quarters
                 canvas.paste(c.resize((size, size * 3 // 4), Image.LANCZOS), (0, 0))
@@ -103,6 +142,7 @@ def main():
             buf = io.BytesIO(); canvas.save(buf, format='JPEG', quality=92)
             files.append((name, buf.getvalue()))
             print('%s %dx%d from %s squeezed to %d wide with black sides' % (name.split('\\')[-1], w, h, src, nw))
+        files += hud_files(game, aspect)
         if files:
             # Root archives: sorted by name, the first copy of a file wins ('!' sorts first).
             # Language archives (lang\<Language>*.big) are applied on top of those, the LAST one wins: sort after the patch's.
@@ -115,11 +155,9 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__)); n = language + 'splash.jpg'
     cs = os.path.join(here, 'custom', n); gs = next((os.path.join(game, f) for f in os.listdir(game) if f.lower() == n), None)
     if os.path.exists(cs) and gs:
-        orig = os.path.join(out, language + 'splash-original.jpg')
-        if not os.path.exists(orig): shutil.copyfile(gs, orig)
-        if Image.open(cs).size == Image.open(orig).size:
+        if Image.open(cs).size == Image.open(gs).size:
             os.makedirs(os.path.join(out, 'root'), exist_ok=True); shutil.copyfile(cs, os.path.join(out, 'root', os.path.basename(gs)))
             print('-> root/%s (enhanced splash, same size)' % os.path.basename(gs))
-        else: print('custom splash ignored: not the size of the original')
+        else: print('custom splash ignored: not the size of the game\'s')
 
 if __name__ == '__main__': main()

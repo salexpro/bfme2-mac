@@ -1493,6 +1493,7 @@ static UINT (WINAPI *o_GetAdapterModeCount)(IDirect3D9 *, UINT, D3DFORMAT);
 static HRESULT (WINAPI *o_EnumAdapterModes)(IDirect3D9 *, UINT, D3DFORMAT, UINT, D3DDISPLAYMODE *);
 struct extras { BOOL valid; D3DFORMAT fmt; UINT count; D3DDISPLAYMODE modes[12]; };
 static struct extras g_extras[6];
+static UINT cfg_gamew, cfg_gameh;      /* the game resolution the launch wrapper picked (0 = not given) */
 
 static struct extras *extras_for(IDirect3D9 *d3d, UINT adapter, D3DFORMAT fmt, UINT real_count)
 {
@@ -1512,14 +1513,19 @@ static struct extras *extras_for(IDirect3D9 *d3d, UINT adapter, D3DFORMAT fmt, U
     dm.dmSize = sizeof(dm);
     if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) || !dm.dmPelsWidth) return e;
     ah = dm.dmPelsHeight - (cfg_topinset < dm.dmPelsHeight / 4 ? cfg_topinset : 0);
-    /* the size the launch wrapper picks: the largest 16:9 picture that fits the usable area (the game lays its
-     * widescreen picture and HUD out for exactly 16:9; any other shape gets squeezed) */
-    cand[nc][0] = (ah * 16 / 9 < dm.dmPelsWidth ? ah * 16 / 9 : dm.dmPelsWidth) & ~1u;
-    cand[nc][1] = (cand[nc][0] * 9 / 16) & ~1u; nc++;
+    /* first the size the launch wrapper picked for this display (gamew/gameh in letterbox.ini: the display's own shape
+     * between 4:3 and 16:9, with the HUD files built for it); without it the largest 16:9 picture that fits */
+    if (cfg_gamew >= 640 && cfg_gameh >= 480 && cfg_gamew <= dm.dmPelsWidth && cfg_gameh <= ah)
+    { cand[nc][0] = cfg_gamew; cand[nc][1] = cfg_gameh; nc++; }
+    else
+    {
+        cand[nc][0] = (ah * 16 / 9 < dm.dmPelsWidth ? ah * 16 / 9 : dm.dmPelsWidth) & ~1u;
+        cand[nc][1] = (cand[nc][0] * 9 / 16) & ~1u; nc++;
+    }
     for (i = 0; i < 3; i++)
     {
         UINT w = (ah * aspects[i][0] / aspects[i][1]) & ~1u;
-        if (w <= dm.dmPelsWidth && w != cand[0][0]) { cand[nc][0] = w; cand[nc][1] = ah; nc++; }
+        if (w <= dm.dmPelsWidth && !(w == cand[0][0] && ah == cand[0][1])) { cand[nc][0] = w; cand[nc][1] = ah; nc++; }
     }
     for (i = 0; i < 6; i++)
         if (standard[i][0] <= dm.dmPelsWidth && standard[i][1] <= ah && !(standard[i][0] == cand[0][0] && standard[i][1] == cand[0][1]))
@@ -1597,6 +1603,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_showfps = (int)GetPrivateProfileIntW(L"letterbox", L"showfps", 0, ini);
             cfg_roundbuttons = (int)GetPrivateProfileIntW(L"letterbox", L"roundbuttons", 1, ini);
             cfg_gamefps = GetPrivateProfileIntW(L"letterbox", L"gamefps", 30, ini);
+            cfg_gamew = GetPrivateProfileIntW(L"letterbox", L"gamew", 0, ini);
+            cfg_gameh = GetPrivateProfileIntW(L"letterbox", L"gameh", 0, ini);
             cfg_logicinterp = (int)GetPrivateProfileIntW(L"letterbox", L"logicinterp", 1, ini);
             cfg_firstphase = (int)GetPrivateProfileIntW(L"letterbox", L"firstphase", 1, ini);
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
