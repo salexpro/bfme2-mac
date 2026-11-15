@@ -40,6 +40,7 @@ static WCHAR g_dir[MAX_PATH];
 
 static struct {
     BOOL on;                 /* letterboxing is active */
+    BOOL full;               /* the game's picture is exactly the screen: nothing to fit, but the cursor is still kept on it */
     UINT gw, gh;             /* the game's (virtual) resolution */
     UINT sw, sh;             /* the real back buffer = current desktop mode */
     RECT dst;                /* where the game picture sits in the real back buffer */
@@ -110,7 +111,7 @@ static void to_virtual(POINT *pt)
 
 static void enforce_clip(BOOL force)
 {
-    if (!g.on || !g.hwnd) return;
+    if ((!g.on && !g.full) || !g.hwnd) return;
     if (GetForegroundWindow() == g.hwnd)
     {
         if (force || !g.clipped) { ClipCursor(&g.dst); g.clipped = TRUE; }
@@ -135,7 +136,7 @@ static BOOL WINAPI h_ClipCursor(const RECT *rc)
 {
     st.clip++;
     /* the cursor stays inside the picture while we have focus; only touch the real clip when it is not set yet */
-    if (g.on) { enforce_clip(FALSE); return TRUE; }
+    if (g.on || g.full) { enforce_clip(FALSE); return TRUE; }
     return ClipCursor(rc);
 }
 static BOOL WINAPI h_GetClientRect(HWND h, RECT *rc)
@@ -178,10 +179,10 @@ static LRESULT CALLBACK lb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             to_virtual(&pt);
             l = MAKELPARAM(pt.x, pt.y);
         }
-        else if (m == WM_KILLFOCUS || (m == WM_ACTIVATEAPP && !w))
-        {
-            if (g.clipped) { ClipCursor(NULL); g.clipped = FALSE; }
-        }
+    }
+    if ((g.on || g.full) && (m == WM_KILLFOCUS || (m == WM_ACTIVATEAPP && !w)))
+    {
+        if (g.clipped) { ClipCursor(NULL); g.clipped = FALSE; }       /* another program is in front: let the cursor go */
     }
     return g.unicode ? CallWindowProcW(g.prev_proc, h, m, w, l) : CallWindowProcA(g.prev_proc, h, m, w, l);
 }
@@ -279,9 +280,50 @@ __attribute__((noinline)) static DWORD WINAPI h_timeGetTime(void)
         }
     }
     else g_vt_lim_last = 0;
-    if ((int)(ret - g_vt_last_ret) < 0) ret = g_vt_last_ret;
+    {
+        /* Never backwards - but only by a little. Holding the last value while the real clock is far behind it would
+         * stop the clock for as long as the difference lasts, and the game's frame limiter waits in a loop on this
+         * clock: with a value far ahead handed out once, that loop never ends. So: more than 100 ms ahead of the real
+         * clock is a mistake, not a hold; drop the frame clock and go on from the real one. */
+        DWORD real = o_timeGetTime();
+        if ((int)(ret - real) > 100 || (int)(real - ret) > 100)
+        {
+            static DWORD said;
+            if (said++ < 20) logf("frame clock: %u was %d ms off the real clock %u; dropped", ret, (int)(ret - real), real);
+            ret = real; g_vt_valid = FALSE; g_vt_last_ret = real; g_vt_lim_last = 0;
+        }
+        if ((int)(ret - g_vt_last_ret) < 0) ret = (int)(g_vt_last_ret - ret) <= 100 ? g_vt_last_ret : ret;
+    }
     g_vt_last_ret = ret;
     return ret;
+}
+
+/* The game's frame limiter (0x63a196 ff.) computes how long a frame should take, 1000 / (fps x factor) ms, and then
+ * waits in a loop (Sleep(0), read the clock) until that much time has passed since the previous frame. If that number
+ * ever comes out wrong (a bad floating-point result becomes 0x80000000 = 24 days) the game stands still for good with
+ * one core busy. No frame is meant to take longer than 100 ms, so the wait is limited to that, and a wrong number is
+ * written to the log with what it was made from. */
+__attribute__((used)) static DWORD __stdcall lim_target(DWORD ms)
+{
+    if (ms > 100)
+    {
+        static DWORD said;
+        BYTE *eng = *(BYTE **)0xde4324;
+        if (said++ < 20)
+            logf("frame limiter: asked to wait %u ms (0x%08x) for one frame; limited to 100. net factor bits %08x, engine fps %d, last frame at %u",
+                 ms, ms, *(DWORD *)0xd9f498, eng && !IsBadReadPtr(eng + 0xc, 4) ? *(int *)(eng + 0xc) : -1, *(DWORD *)0xde4318);
+        return 100;
+    }
+    return ms;
+}
+__attribute__((naked)) static void h_LimTarget(void)       /* replaces: mov esi,eax / mov ecx,edi / sub ecx,[0xde4318] */
+{
+    __asm__("pushl %eax\n"
+            "call _lim_target@4\n"
+            "movl %eax, %esi\n"
+            "movl %edi, %ecx\n"
+            "subl 0xde4318, %ecx\n"
+            "ret\n");
 }
 
 /* When to lock. Locking only helps while the game finishes every frame well inside one refresh; a frame that needs
@@ -384,7 +426,15 @@ static BOOL prepare(const D3DPRESENT_PARAMETERS *pp, D3DPRESENT_PARAMETERS *real
     g.sw = dm.dmPelsWidth; g.sh = dm.dmPelsHeight;
     g.gw = pp->BackBufferWidth; g.gh = pp->BackBufferHeight;
     real->BackBufferWidth = g.sw; real->BackBufferHeight = g.sh;
-    if (!g.gw || !g.gh || (g.gw == g.sw && g.gh == g.sh)) return FALSE;
+    g.full = FALSE;
+    if (g.gw && g.gw == g.sw && g.gh == g.sh)
+    {
+        /* The picture is the screen. With a second monitor next to it the cursor would wander off at that edge (the
+         * game confines it once at start and never again), so keep it here the same way as with a letterboxed picture. */
+        SetRect(&g.dst, 0, 0, g.sw, g.sh); g.dw = g.sw; g.dh = g.sh; g.full = TRUE;
+        return FALSE;
+    }
+    if (!g.gw || !g.gh) return FALSE;
     {
         UINT inset = cfg_topinset < g.sh / 4 ? cfg_topinset : 0, ah = g.sh - inset;      /* usable height below the inset */
         if ((ULONGLONG)g.gw * ah <= (ULONGLONG)g.sw * g.gh) { g.dh = ah; g.dw = MulDiv(g.gw, ah, g.gh); }
@@ -681,6 +731,17 @@ static void run_commands(IDirect3DDevice9 *dev)
         return;
     }
     if (!strncmp(line, "budget ", 7)) { a = line + 7; set_jump_budget(next_int(&a)); return; }
+    if (!strncmp(line, "cursor", 6))     /* where the cursor is, what it is confined to, how many monitors there are */
+    {
+        RECT c = { 0, 0, 0, 0 }; POINT p = { 0, 0 };
+        GetClipCursor(&c); GetCursorPos(&p);
+        logf("cursor: at %d,%d; confined to %d,%d..%d,%d; desktop %d,%d %dx%d on %d monitor(s); game window in front: %s; picture %d,%d..%d,%d (%s)",
+             (int)p.x, (int)p.y, (int)c.left, (int)c.top, (int)c.right, (int)c.bottom,
+             GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
+             GetSystemMetrics(SM_CMONITORS), GetForegroundWindow() == g.hwnd ? "yes" : "no",
+             (int)g.dst.left, (int)g.dst.top, (int)g.dst.right, (int)g.dst.bottom, g.on ? "letterboxed" : g.full ? "fills the screen" : "not set");
+        return;
+    }
     if (!strncmp(line, "click ", 6))
     {
         a = line + 6; click_x = next_int(&a); click_y = next_int(&a);
@@ -1137,6 +1198,12 @@ static void patch_game_code(void)
 {
     static const DWORD tint_sites[] = { 0x6757aa, 0x67597d, 0x675dd1, 0x675e1c, 0x675e86, 0x675ed4, 0x67910e };
     int i, n = 0;
+    {
+        static const BYTE lim_old[10] = { 0x8B, 0xF0, 0x8B, 0xCF, 0x2B, 0x0D, 0x18, 0x43, 0xDE, 0x00 };
+        BYTE r[10]; DWORD rel = (DWORD)(ULONG_PTR)h_LimTarget - (0x63a1b2 + 5);
+        r[0] = 0xE8; memcpy(r + 1, &rel, 4); memset(r + 5, 0x90, 5);
+        logf("frame limiter guard (a frame waits 100 ms at most): %s", patch_bytes(0x63a1b2, lim_old, r, 10) ? "on" : "NOT applied (unexpected code)");
+    }
     if (cfg_roundbuttons)
     {
         /* both size queries of the draw routine (picture, then ring/overlays) use the same four locals */
@@ -1407,6 +1474,17 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
     }
     else
     {
+        if (g.full)
+        {
+            IDirect3DSurface9 *bb = NULL;
+            enforce_clip(FALSE);
+            if ((cfg_showfps || shot_bb_name[0]) && SUCCEEDED(IDirect3DDevice9_GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
+            {
+                if (cfg_showfps) draw_fps(dev, bb);
+                if (shot_bb_name[0]) { shot_from_bb = TRUE; save_shot(dev, shot_bb_name, 3); shot_from_bb = FALSE; shot_bb_name[0] = 0; }
+                IDirect3DSurface9_Release(bb);
+            }
+        }
         QueryPerformanceCounter(&t);
         hr = o_Present(dev, src, dst, wnd, dirty);
     }
