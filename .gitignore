@@ -1,0 +1,23 @@
+# build outputs (see letterbox/build.sh and sage-unlocked/build.sh)
+*.dll
+*.pdb
+*.lib
+# logs, backups, local state
+*.log
+*.bak*
+shots/
+display-override.conf
+sage-unlocked/disabled
+# intermediate copies of the patched SAGE Unlocked source (the current one is source-fexfix4)
+sage-unlocked/source-fexfix/
+sage-unlocked/source-fexfix2/
+sage-unlocked/source-fexfix3/
+# per-machine or not redistributable: a serial, Microsoft's d3dx9_27.dll, art built from the game's files
+transfer/ergc-*.txt
+widescreen-art/out/
+# earlier experiments that are not part of this setup
+bfme2.sh
+dgvoodoo-override.reg
+fex-game.reg
+.DS_Store
+sage-unlocked/source-fexfix4/*.diff

@@ -1,0 +1,167 @@
+--- a/Unlocker.cs
++++ b/Unlocker.cs
+@@ -16,7 +16,7 @@
+ 
+ static class Program
+ {
+-    public const string Version = "1.9.6";   // keep in step with installer/setup.iss
++    public const string Version = "1.9.6+fexfix4";   // keep in step with installer/setup.iss
+     const uint ImageBase = 0x400000;
+ 
+     // called from inside the game (dll/proxy.c)
+@@ -352,7 +352,10 @@
+         if (On("zoomin") && zoomInOpt < 1f && zoomSite != 0 && ZoomMinOk(img, zoomSite)) PatchZoomIn(proc, zoomSite + 0x16, netObject, zoomInOpt, (uint)mem + 0x1840, (uint)mem + 0x1850);   // +1840h..+1880h
+         if (shadowMapOpt > 0 && shadowSites != null && On("shadowmap")) PatchShadowMap(proc, shadowSites, shadowMapOpt);   // extra
+         if (On("fades") && fades.Count > 0) PatchFadeFrameReads(proc, img, fades, (uint)mem, (uint)mem + 0x440);
+-        if (On("scroll") && scrollSlot != 0 && fps > 30) PatchScrollBy(proc, scrollSlot, scrollFunc, fps, (uint)mem + 0x4F0, (uint)mem + 0x4F8, (uint)mem + 0x3C0);
++        if (On("scroll") && scrollSlot != 0 && fps > 30) {
++            uint scrollData = (uint)AllocData(proc, 0x1000); if (scrollData == 0) scrollData = (uint)mem;   // [fexfix]
++            PatchScrollBy(proc, scrollSlot, scrollFunc, fps, (uint)mem + 0x4F0, scrollData + 0x4F8, (uint)mem + 0x3C0);
++        }
+         if (On("interp") && interpWindow.Count > 0) PatchInterpWindow(proc, interpWindow, fps);
+         if (On("camerakeys") && held != null && fps > 30) PatchHeldCamera(proc, img, held, fps, (uint)mem + 0xC00, (uint)mem + 0xC40);
+         // drawn interp steps on the effect clock within a tick
+@@ -1372,13 +1375,26 @@
+         s.FfGlobal = hits[0].Item1; s.FfOff = hits[0].Item2;
+     }
+ 
+-    static void PatchScheduler(IntPtr proc, byte[] img, SchedSite site, uint fpsVa, uint mem, bool batches = false, uint frameClock = 0, int fps = 0)
++    // [fexfix2] code: where the stubs go; mem: where the variables they write every frame live. Kept on separate pages
++    // when the caller passes a code base: under the FEX x86 emulator a stub that stores to its own code page gets part of
++    // itself executed twice (the clock came out as timeGetTime*9 instead of *3, so the game ran 3x too fast).
++    static void PatchScheduler(IntPtr proc, byte[] img, SchedSite site, uint fpsVa, uint mem, bool batches = false, uint frameClock = 0, int fps = 0, uint code = 0)
+     {
++        if (code == 0) code = mem;
+         Func<uint, byte[]> u = BitConverter.GetBytes;
+         uint eng = mem + 0x3C, r = mem + 0x38, now3 = mem + 0x80, t0 = mem + 0x84, pend = mem + 0x88, k200 = mem + 0x8C;
+-        uint stubA = mem + 0x800, stubB = mem + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
++        uint stubA = code + 0x800, stubB = code + 0xA00, table = mem + 0xB0, tickFrame = mem + 0xC8, prevNow = mem + 0xCC, prevA = mem + 0xD0;
++        uint held = mem + 0xD4;   // [fexfix3] the network held the tick back at least once before it started
++        // [fexfix4] BFME II (separate data page): the drawn interpolation runs evenly over the whole tick. The game latches
++        // each value at the first frame of a tick (phase 1) and draws base + interp * delta, so interp has to go
++        // frame/tick ... 1.0 from that frame on. It used to be measured from tickStart, which is a sixth of a tick before
++        // phase 1: it began at 1/6, hit 1.0 a sixth early and froze there (3-4 frames at 120 fps), then jumped: steady
++        // movers such as birds showed missing frames five times a second.
++        bool even = code != mem && !batches && frameClock == 0;
++        uint tickBegin = mem + 0xD8, bnd = mem + 0xE0;   // time of the tick's first frame; k*T/6 for k = 0..6
+         // phase k is due once
+         int T = site.Tick * 99 / 100;
++        if (even) for (int k = 0; k <= 6; k++) Write(proc, bnd + (uint)(k * 4), BitConverter.GetBytes(k * T / 6));
+         for (int k = 1; k <= 6; k++) Write(proc, table + (uint)((k - 1) * 4), BitConverter.GetBytes(k * T / 6 - 3));   // 30 63 97 130 163 197 at 15 hz
+         // batches: phases 1-3 run together when the tick starts
+         uint itable = table;
+@@ -1411,8 +1427,20 @@
+         a.E(0x8B, 0x4E, ph);                                         // ecx = phase
+         a.E(0x83, 0x3D); a.D(pend); a.E(0x00); a.J(0x74, "nopend");  // started a tick last frame?
+         a.E(0xC7, 0x05); a.D(pend); a.D(0);
+-        a.E(0x83, 0xF9, 0x06); a.J(0x72, "nopend");                 // wrapped = it started
++        a.E(0x83, 0xF9, 0x06); a.J(0x72, "started");                // wrapped = it started
+         a.E(0x81, 0x2D); a.D(t0); a.D((uint)T);                      // network held it back, undo
++        a.E(0xC7, 0x05); a.D(held); a.D(1);                          // [fexfix3] remember that
++        a.J(0xEB, "nopend");
++        a.L("started");
++        // [fexfix3] Multiplayer: the network decides when a tick starts, not this clock. Without this the schedule ran
++        // behind the real start, so all six phases ran in the first frames of a tick and the drawn interpolation hit 1.0
++        // early: everything moved for ~70 ms and then stood still for the rest of the 200 ms tick. When a held-back tick
++        // finally starts, restart the schedule from the frame that started it (last frame's time = phase 1).
++        a.E(0x83, 0x3D); a.D(held); a.E(0x00); a.J(0x74, "nopend");
++        a.E(0xC7, 0x05); a.D(held); a.D(0);
++        a.E(0x8B, 0x15); a.D(prevA);                                 // edx = last frame's now3
++        a.E(0x81, 0xEA); a.D((uint)(T / 6 - 3));                     // phase 1 sits at T/6 - 3 on the timetable
++        a.E(0x89, 0x15); a.D(t0);                                    // tickStart = that
+         a.L("nopend");
+         a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                        // edx = t = now3 - tickStart
+         a.E(0x50, 0x2B, 0x05); a.D(prevA);                           // push eax / eax = frame length
+@@ -1460,7 +1488,7 @@
+         realClockFn = 0;
+         if (realclockOpt && On("realclock") && site.TimeFn != 0)
+         {
+-            uint fn = mem + 0x1080, rbase = mem + 0x1040;
++            uint fn = code + 0x1080, rbase = mem + 0x1040;
+             var rc = new Asm(fn);
+             rc.E(0x51, 0x52); rc.Rel(0xE8, site.TimeFn);                          // push ecx / push edx / eax = ms
+             rc.E(0x8B, 0x0D); rc.D(rbase); rc.E(0x85, 0xC9); rc.J(0x75, "have");    // first call: base = now
+@@ -1490,7 +1518,7 @@
+         {
+             // #30: now3 is read when the frame starts
+             uint lastT0 = mem + 0x1770, ibase = mem + 0x1774, w0 = mem + 0x1778, r0 = mem + 0x177C, rem = mem + 0x1600;   // rem: PatchClock
+-            uint fi = mem + 0x1780;
++            uint fi = code + 0x1780;
+             var f = new Asm(fi);
+             f.E(0xA1); f.D(now3); f.E(0xA3); f.D(prevNow);                   // prevNow = now3 (kept up to date)
+             f.E(0xA1); f.D(t0); f.E(0x3B, 0x05); f.D(lastT0); f.J(0x74, "same");
+@@ -1510,13 +1538,22 @@
+         }
+         else
+         {
++            if (even)
++            {
++                // a tick started on this frame: stub A asked for it (pend) and the engine wrapped the phase to 1
++                b.E(0x83, 0x3D); b.D(pend); b.E(0x01); b.J(0x75, "nb");
++                b.E(0x83, 0x7E, ph, 0x01); b.J(0x75, "nb");
++                b.E(0xA1); b.D(now3); b.E(0xA3); b.D(tickBegin);
++                b.L("nb");
++            }
+             b.E(0xA1); b.D(now3); b.E(0x8B, 0xD0, 0x2B, 0x15); b.D(prevNow);   // edx = frame length
+             b.E(0xA3); b.D(prevNow);
+             b.E(0x85, 0xD2); b.J(0x7D, "dpos"); b.E(0x33, 0xD2);
+             b.L("dpos");
+             b.E(0x83, 0xFA, 0x64); b.J(0x7E, "dok"); b.E(0xBA); b.D(100);         // clamp 0..100
+             b.L("dok");
+-            b.E(0x2B, 0x05); b.D(t0); b.E(0x03, 0xC2);                           // eax = now - tickStart + frame length
++            b.E(0x2B, 0x05); b.D(even ? tickBegin : t0); b.E(0x03, 0xC2);        // eax = now - tick start + frame length
++            if (even) itable = bnd;                                              // bounds (phase-1)/6 .. phase/6
+         }
+         b.E(0x85, 0xC0); b.J(0x7D, "b1"); b.E(0x33, 0xC0);
+         b.L("b1");
+@@ -2604,6 +2641,7 @@
+         IntPtr mem = Alloc(proc, 0x2000);   // the shared scheduler keeps tables at +1000h and up
+         if (mem == IntPtr.Zero) throw new Exception("couldn't allocate patch memory");
+         uint m = (uint)mem;
++        uint data = (uint)AllocData(proc, 0x1000); if (data == 0) data = m;   // [fexfix] run-time scratch, off the code page
+         patchMem = m; patchMemSize = 0x2000; memWrites.Clear(); memOverlaps.Clear();
+         Write(proc, m, BitConverter.GetBytes(fps));
+         foreach (var r in b.Restore) Write(proc, r.Item1, r.Item2);
+@@ -2631,7 +2669,7 @@
+         // spell store update at most every 33 ms
+         if (b.StoreJmp != 0 && On("spellstore") && fps > 30)
+         {
+-            uint stub = m + 0xE00, last = m + 0xE80;
++            uint stub = m + 0xE00, last = data + 0xE80;   // [fexfix]
+             var a = new Asm(stub);
+             a.E(0x51);                                   // push ecx (the store)
+             a.E(0xFF, 0x15); a.D(b.TimeIat);             // call [timeGetTime]
+@@ -2647,14 +2685,15 @@
+             var p = new List<byte> { 0xE9 }; p.AddRange(BitConverter.GetBytes(stub - (b.StoreJmp + 5)));
+             Write(proc, b.StoreJmp, p.ToArray());
+         }
+-        if (b.ScrollSlot != 0 && On("scroll") && fps > 30) PatchScrollBy(proc, b.ScrollSlot, b.ScrollFunc, fps, m + 0x4F0, m + 0x4F8, m + 0x3C0);
++        if (b.ScrollSlot != 0 && On("scroll") && fps > 30) PatchScrollBy(proc, b.ScrollSlot, b.ScrollFunc, fps, m + 0x4F0, data + 0x4F8, m + 0x3C0);   // [fexfix]
+         if (sched)
+         {
+             // its clock is timeGetTime straight from the import table: jmp [iat]
+             var t = new List<byte> { 0xFF, 0x25 }; t.AddRange(BitConverter.GetBytes(b.TimeIat));
+             Write(proc, m + 0xF80, t.ToArray());
+             b.Sched.TimeFn = m + 0xF80;
+-            PatchScheduler(proc, img, b.Sched, m, m);
++            uint sdata = (uint)AllocData(proc, 0x2000); if (sdata == 0) sdata = m;   // [fexfix2] scheduler variables off the code page
++            PatchScheduler(proc, img, b.Sched, m, sdata, code: m);
+         }
+         FlushCode(proc);
+         Func<IEnumerable<uint>, string> hex = l => string.Join(" ", l.Where(a => a != 0).Select(a => "0x" + a.ToString("X")));
+@@ -2797,6 +2836,15 @@
+     const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_EXECUTE_READWRITE = 0x40;
+ 
+     // memory helpers
++    // [fexfix] Data that the patch stubs write at run time gets its own non-executable page. Under an x86
++    // emulator (FEX on ARM64) a write to a page that also holds translated code faults and makes the emulator
++    // throw that page's translations away; the scroll stub did that on every scrollBy call.
++    static IntPtr AllocData(IntPtr proc, int size)
++    {
++        const uint PAGE_READWRITE = 0x04;
++        return proc == IntPtr.Zero ? VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
++                                   : VirtualAllocEx(proc, IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++    }
+     static IntPtr Alloc(IntPtr proc, int size)
+     {
+         return proc == IntPtr.Zero ? VirtualAlloc(IntPtr.Zero, (UIntPtr)size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)

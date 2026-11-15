@@ -1,0 +1,30 @@
+REGEDIT4
+
+[HKEY_LOCAL_MACHINE\Software\Wow6432Node\Electronic Arts\Electronic Arts\The Battle for Middle-earth II]
+"InstallPath"="C:\\BFME2\\"
+"Language"="English"
+"MapPackVersion"=dword:00010000
+"UseLocalUserMaps"=dword:00000000
+"UserDataLeafName"="My Battle for Middle-earth II Files"
+"Version"=dword:00010003
+
+[HKEY_LOCAL_MACHINE\Software\Wow6432Node\Electronic Arts\Electronic Arts\The Battle for Middle-earth II\ergc]
+@="@ERGC@"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\App Paths\lotrbfme2.exe]
+@="C:\\BFME2\\lotrbfme2.exe"
+"Game Registry"="SOFTWARE\\Electronic Arts\\Electronic Arts\\The Battle for Middle-earth II"
+"Path"="C:\\BFME2\\"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\game.dat\DllOverrides]
+"d3d9"="native,builtin"
+"d3dx9_27"="native,builtin"
+"dinput8"="native,builtin"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\game.dat\Mac Driver]
+"CaptureDisplaysForFullscreen"="n"
+"RetinaMode"="n"
+
+[HKEY_CURRENT_USER\Software\Wine\AppDefaults\lotrbfme2.exe\Mac Driver]
+"CaptureDisplaysForFullscreen"="n"
+"RetinaMode"="n"
