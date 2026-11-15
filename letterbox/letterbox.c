@@ -1365,6 +1365,66 @@ static void draw_fps(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb)
     }
 }
 
+/* ---- where the game thread waits ----
+ * A frame that stands still for a long time before it starts to draw is waiting for something (the other player's
+ * data in a network game, a timer). The game's own Sleep, WaitForSingleObject and select calls on the game thread are
+ * timed per calling address; a frame that waited more than 100 ms before drawing gets a line saying where. */
+static DWORD g_main_tid;
+static struct { DWORD ra; char kind; DWORD us, calls; } g_waits[8];
+static int (WINAPI *o_select)(int, void *, void *, void *, const void *);
+static void wait_note(char kind, DWORD ra, DWORD us)
+{
+    int i, min = 0;
+    for (i = 0; i < 8; i++)
+    {
+        if (g_waits[i].ra == ra && g_waits[i].kind == kind) { g_waits[i].us += us; g_waits[i].calls++; return; }
+        if (!g_waits[i].calls) { g_waits[i].ra = ra; g_waits[i].kind = kind; g_waits[i].us = us; g_waits[i].calls = 1; return; }
+        if (g_waits[i].us < g_waits[min].us) min = i;
+    }
+    if (us > g_waits[min].us) { g_waits[min].ra = ra; g_waits[min].kind = kind; g_waits[min].us = us; g_waits[min].calls = 1; }
+}
+static void WINAPI h_Sleep(DWORD ms)
+{
+    LARGE_INTEGER a, b;
+    if (GetCurrentThreadId() != g_main_tid) { Sleep(ms); return; }
+    QueryPerformanceCounter(&a); Sleep(ms); QueryPerformanceCounter(&b);
+    wait_note('S', (DWORD)(ULONG_PTR)__builtin_return_address(0), us_between(&a, &b));
+}
+static DWORD WINAPI h_WaitForSingleObject(HANDLE h, DWORD ms)
+{
+    LARGE_INTEGER a, b; DWORD r;
+    if (GetCurrentThreadId() != g_main_tid) return WaitForSingleObject(h, ms);
+    QueryPerformanceCounter(&a); r = WaitForSingleObject(h, ms); QueryPerformanceCounter(&b);
+    wait_note('W', (DWORD)(ULONG_PTR)__builtin_return_address(0), us_between(&a, &b));
+    return r;
+}
+static int WINAPI h_select(int n, void *rd, void *wr, void *ex, const void *tv)
+{
+    LARGE_INTEGER a, b; int r;
+    if (GetCurrentThreadId() != g_main_tid) return o_select(n, rd, wr, ex, tv);
+    QueryPerformanceCounter(&a); r = o_select(n, rd, wr, ex, tv); QueryPerformanceCounter(&b);
+    wait_note('N', (DWORD)(ULONG_PTR)__builtin_return_address(0), us_between(&a, &b));
+    return r;
+}
+static void waits_report(DWORD before_scene_us)
+{
+    static DWORD last_tick;
+    char line[400]; int i, n = 0;
+    BYTE *eng = *(BYTE **)0xde4324;
+    DWORD now = GetTickCount();
+    if (before_scene_us < 100000 || now - last_tick < 2000) return;       /* at most one line every two seconds */
+    last_tick = now;
+    line[0] = 0;
+    for (i = 0; i < 8 && n < 330; i++)
+        if (g_waits[i].calls && g_waits[i].us >= 2000)
+            n += wsprintfA(line + n, " %s from %08x: %u ms in %u calls;", g_waits[i].kind == 'S' ? "Sleep" : g_waits[i].kind == 'W' ? "WaitForSingleObject" : "select",
+                           g_waits[i].ra, g_waits[i].us / 1000, g_waits[i].calls);
+    logf("    stood still %u ms before drawing. waits:%s | phase %d of %d, net factor bits %08x, limiter flag %u", before_scene_us / 1000,
+         n ? line : " none of the three kinds (busy, or another kind of wait)",
+         eng && !IsBadReadPtr(eng + 0x38, 4) ? *(int *)(eng + 0x34) : -1, eng && !IsBadReadPtr(eng + 0x38, 4) ? *(int *)(eng + 0x38) : -1,
+         *(DWORD *)0xd9f498, (UINT)*(BYTE *)0xde4320);
+}
+
 static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const RECT *dst, HWND wnd, const RGNDATA *dirty)
 {
     /* every 10 s: average fps, frame-time spread, time spent waiting in Present, and the mouse traffic */
@@ -1405,6 +1465,9 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
             }
         }
     }
+    waits_report(fr.first_scene_us);
+    ZeroMemory(g_waits, sizeof(g_waits));
+    g_main_tid = GetCurrentThreadId();
     rec_texcreates = fr.tex_creates;
     rec_frame(dev);
     {
@@ -1707,6 +1770,14 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
         iat_hook(exe, "user32.dll", "GetCursorPos", h_GetCursorPos);
         iat_hook(exe, "user32.dll", "SetCursorPos", h_SetCursorPos);
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
+        iat_hook(exe, "kernel32.dll", "Sleep", h_Sleep);                               /* wait recorder, see waits_report */
+        iat_hook(exe, "kernel32.dll", "WaitForSingleObject", h_WaitForSingleObject);
+        {
+            HMODULE ws = GetModuleHandleA("ws2_32.dll");
+            if (!ws) ws = GetModuleHandleA("wsock32.dll");
+            if (ws && (o_select = (void *)GetProcAddress(ws, "select")) != NULL)
+            { iat_hook(exe, "ws2_32.dll", "select", h_select); iat_hook(exe, "wsock32.dll", "select", h_select); }
+        }
         iat_hook(exe, "user32.dll", "GetClientRect", h_GetClientRect);
         iat_hook(exe, "user32.dll", "GetWindowRect", h_GetWindowRect);
         iat_hook(exe, "user32.dll", "GetSystemMetrics", h_GetSystemMetrics);
