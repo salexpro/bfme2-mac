@@ -1,5 +1,10 @@
 """Blend the 4:3 loading picture and the graded film around it into one 16:9 image.
-   blend.py <loading texture> <dir with film-full.png, film-valid.png> <out png> [brightness at the outer edge, default 0.5]
+   blend.py <texture> <dir with film-full.png, film-valid.png> <out png> [--outer 0.5] [--text-y 630 | --text-y 0]
+            [--band <first row> <last row> <period in px>]
+   --text-y: first row of the legal text at the bottom (0 = the picture has none)
+   --band:   rows of an opaque ornament that runs across the whole width with a repeating pattern (the second
+             loading picture has one, with the socket for the spinning ring); it is continued into the sides by
+             repeating the pattern
 
 The picture is the film frame plus the artist's shading (a vignette with a dark frame along the border, a dark band at
 the bottom, glow) and overlays. So:
@@ -10,10 +15,14 @@ the bottom, glow) and overlays. So:
  4. The sides are E * R'. In the picture's border zone its old vignette is exchanged for the new one (picture * R'/R),
     and under the outermost part, where the old frame is nearly black, the film shows through instead.
     The rows with the legal text keep the picture right up to its border."""
-import sys
+import argparse
 import numpy as np, cv2
-artp, d, outp = sys.argv[1:4]; outer = float(sys.argv[4]) if len(sys.argv) > 4 else 0.5
-W, H, WIDE, TEXT_Y = 1368, 768, 96, 630
+ap = argparse.ArgumentParser(); ap.add_argument('art'); ap.add_argument('dir'); ap.add_argument('out')
+ap.add_argument('--outer', type=float, default=0.5); ap.add_argument('--text-y', type=int, default=630)
+ap.add_argument('--band', type=int, nargs=3, metavar=('Y0', 'Y1', 'PERIOD'))
+args = ap.parse_args(); artp, d, outp, outer = args.art, args.dir, args.out, args.outer
+W, H, WIDE = 1368, 768, 96
+TEXT_Y = args.text_y if args.text_y > 0 else H + 40      # no legal text: no row keeps the picture up to its border
 art = cv2.imread(artp)[:768, :1024].astype(np.float32); pad = (W - 1024) // 2
 E = cv2.imread(d + '/film-full.png').astype(np.float32)
 valid = cv2.erode(cv2.imread(d + '/film-valid.png', 0), np.ones((7, 7), np.uint8)) > 127
@@ -29,13 +38,27 @@ for x in range(x1 + 1, W): E[:, x] = E[:, max(2 * x1 - x, x0)]
 for (a, b, sgn) in ((0, y0, -1), (y1 + 1, H, 1)):                       # soften the mirrored bands a little
     if b > a: E[a:b] = cv2.GaussianBlur(E[a:b], (0, 0), 1.2)
 
+# 1b. an ornament band across the picture: in its rows E is the picture itself, continued sideways by its pattern
+if args.band:
+    by0, by1, P = args.band; CLEAN = 64                                 # take the pattern from inside the border shading
+    src = np.arange(W) - pad                                            # canvas column -> picture column
+    lo = src < CLEAN; src[lo] += ((CLEAN - src[lo] + P - 1) // P) * P
+    hi = src > 1023 - CLEAN; src[hi] -= ((src[hi] - (1023 - CLEAN) + P - 1) // P) * P
+    tiled = art[:, src]                                                 # (rows, W, 3)
+    wy = np.clip(np.minimum(np.arange(H) - (by0 - 2), (by1 + 2) - np.arange(H)) / 2.0, 0, 1)     # 1 on the band's rows
+    E = E * (1 - wy[:, None, None]) + tiled * wy[:, None, None]
+else: wy = np.zeros(H, np.float32)
+
 # 2. the picture's shading relative to the film
 A = np.zeros((H, W), np.float32); A[:, pad:pad + 1024] = lum(art); M = np.zeros((H, W), np.float32); M[:, pad:pad + 1024] = 1
 M[485:700, pad + 90:pad + 280] = 0                                       # the rider: not in the same place in film and picture
-M[TEXT_Y:, :] *= (A[TEXT_Y:, :] < 55)                                     # the legal text is not shading
+if TEXT_Y < H: M[TEXT_Y:, :] *= (A[TEXT_Y:, :] < 55)                      # the legal text is not shading
 El = np.maximum(lum(E), 1.0)
 blur = lambda a: cv2.GaussianBlur(a, (0, 0), 18)
-R = np.clip(blur(A * M) / np.maximum(blur(El * M), 1e-3), 0.02, 3.0)
+shading = lambda m: np.clip(blur(A * m) / np.maximum(blur(El * m), 1e-3), 0.02, 3.0)
+onband = (wy > 0)[:, None].astype(np.float32)                           # the band and the picture around it are shaded
+Ro, Ri = shading(M * (1 - onband)), shading(M * onband)                 # differently: measured apart, no leaking
+R = Ro * (1 - wy[:, None]) + Ri * wy[:, None]
 
 # 3. the shading for the wide picture
 xs = np.arange(W, dtype=np.float32); dist = np.minimum(xs - pad, pad + 1024 - 1 - xs)      # > 0 inside the picture
@@ -44,8 +67,9 @@ tt = np.clip((80 - dist) / (pad + 80), 0, 1)
 fall = (1 - (1 - outer) * tt ** 1.4) * (1 - 0.6 * np.clip((tt - 0.88) / 0.12, 0, 1) ** 1.5)  # vignette + dark frame at the edge
 Rn = np.zeros((H, W), np.float32)
 for side in (True, False):
-    ref = R[:, pad + 100:pad + 140] if side else R[:, W - pad - 140:W - pad - 100]
-    rref = cv2.GaussianBlur(ref.mean(1).reshape(-1, 1), (0, 0), 6).ravel()
+    cols = slice(pad + 100, pad + 140) if side else slice(W - pad - 140, W - pad - 100)
+    sm = lambda r: cv2.GaussianBlur(r[:, cols].mean(1).reshape(-1, 1), (0, 0), 6).ravel()
+    rref = sm(Ro) * (1 - wy) + sm(Ri) * wy
     sel = left if side else ~left
     Rn[:, sel] = rref[:, None] * fall[None, sel]
 

@@ -23,7 +23,7 @@ No game files are included. You need your own installation of the game.
 | Round command buttons over buildings are ovals at 16:9 | Drawn round. |
 | In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
-| The loading screen is a 4:3 picture | Optional: `widescreen-art/loading-screen/` rebuilds it as a real 16:9 picture from a still of the film shot it was made from (you supply the still), carries the picture's own shading into the new sides and sharpens it with Real-ESRGAN. |
+| The two start-up loading pictures are 4:3 | Optional: `widescreen-art/loading-screen/` rebuilds both as real 16:9 pictures from a still of the film shot they were made from (you supply the still), carries the pictures' own shading into the new sides, continues the ornament band of the second one (the socket of the spinning ring stays where the game draws the ring) and sharpens them with Real-ESRGAN. |
 
 Multiplayer on a LAN between two Macs set up this way works (lobby, join, matches stay in sync). Each machine needs
 its own serial (`ergc` registry value); the setup script takes it as an argument.
