@@ -1,9 +1,9 @@
 #!/bin/bash
 # Run on a Mac that is already set up: copy BFME II and this whole folder to another Mac over SSH and register the game
 # in that Mac's Steam as a non-Steam shortcut on the NotProton FEX runner.
-#   push-to-mac.sh <user@host> <ergc-key> files      copy the game (6.3 GB) and the tools
-#   push-to-mac.sh <user@host> <ergc-key> steam      add the Steam shortcut + compatibility tool + artwork (quits and restarts Steam there)
-#   push-to-mac.sh <user@host> <ergc-key> prefix     first launch (creates the prefix; shows Wine's About box), then set the prefix up
+#   copy-to-another-mac.sh <user@host> <ergc-key> files      copy the game (6.3 GB) and the tools
+#   copy-to-another-mac.sh <user@host> <ergc-key> steam      add the Steam shortcut + compatibility tool + artwork (quits and restarts Steam there)
+#   copy-to-another-mac.sh <user@host> <ergc-key> prefix     first launch (creates the prefix; shows Wine's About box), then set the prefix up
 # The other Mac needs: Steam signed in, NotProton with the notproton-fex-41073 tool, Remote Login with this Mac's key.
 # Settings (environment or local.conf in this folder's parent, see env.sh): BFME_GAME = the game folder on this Mac;
 # optional BFME_APPID (the shortcut's appid, any id Steam does not use yet) and BFME_ICON (a .png for the shortcut).
@@ -28,7 +28,7 @@ files)
   echo "copying the game ..."
   tar -C "$SRC_GAME" --exclude './letterbox.log' --exclude './letterbox.cmd' --exclude './SAGEUnlocked.log' --exclude './*.bmp' -cf - . | $S "$DEST" "tar -C $(q "$RGAME") -xf -" || exit 1
   echo "copying the tools ..."
-  tar -C "$TOOLS" --exclude './.git' --exclude './shots' --exclude '*.bak*' --exclude '*.log' --exclude './transfer/ergc-*' \
+  tar -C "$TOOLS" --exclude './.git' --exclude './shots' --exclude '*.bak*' --exclude '*.log' --exclude './setup/ergc-*' --exclude './.last-launch' \
       --exclude './display-override.conf' --exclude './local.conf' --exclude './widescreen-art/custom' \
       --exclude './sage-unlocked/source-fexfix' --exclude './sage-unlocked/source-fexfix2' --exclude './sage-unlocked/source-fexfix3' \
       -cf - . | $S "$DEST" "tar -C $(q "$RT") -xf -" || exit 1
@@ -93,7 +93,7 @@ PY
   ;;
 prefix)
   $S "$DEST" "open 'steam://rungameid/$GAMEID'; for i in \$(seq 1 120); do [ -f $(q "$RSTEAM/steamapps/compatdata/$APPID/pfx/system.reg") ] && pgrep -f winver >/dev/null && break; sleep 1; done; sleep 4; pkill -f winver; sleep 6; tail -3 $(q "$RT/bfme2-fex.log")"
-  $S "$DEST" "$(q "$RT/transfer/setup-prefix.sh") $APPID $(q "$KEY")"
+  $S "$DEST" "$(q "$RT/setup/setup-prefix.sh") $APPID $(q "$KEY")"
   ;;
 *) echo "stage?"; exit 2 ;;
 esac

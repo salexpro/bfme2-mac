@@ -13,7 +13,7 @@ No game files are included. You need your own installation of the game.
 | The game switches the display mode for its resolution (stretched picture; on some Mac + monitor combinations a mode switch can even crash the machine) | `letterbox/d3d9.dll` creates the real Direct3D device at the current desktop mode and fits the game's picture inside it with black bars. The display mode is never changed. |
 | Resolution has to be picked by hand per screen | The launch wrapper measures the main display at every start and sets the resolution (the display's own shape between 4:3 and 16:9, 16:9 on anything wider), the frame-rate cap and (on MacBooks) the notch offset. Plug in another monitor and the next start follows it. |
 | The patch's HUD is right only at exactly 16:9; on a MacBook's 16:10 the minimap is an oval, so you play 16:9 with bars | `widescreen-art/hud.py` computes the HUD files for any shape between 4:3 and 16:9 from the game's original and the patch's 16:9 copies. A MacBook uses its whole screen below the camera housing, with a round minimap. |
-| Units are invisible (health bars and rings without models) | The game's prefix needs Microsoft's `d3dx9_27.dll`; `transfer/setup-prefix.sh` puts it in place. |
+| Units are invisible (health bars and rings without models) | The game's prefix needs Microsoft's `d3dx9_27.dll`; `setup/setup-prefix.sh` puts it in place. |
 | Scrolling and minimap jumps freeze for up to seconds | The terrain's mip-maps are built by a fast filter instead of D3DX (32 ms → 0.13 ms per tile); a camera jump bakes its tiles over a few frames. |
 | Locked to 30 fps | A patched build of [SAGE Unlocked](https://github.com/TheeHorse/SAGE-Unlocked) (`sage-unlocked/`) runs the game at the display's refresh rate with game logic at its normal 5 ticks per second. |
 | With the unlock under the FEX emulator the game ran 3x too fast | Fixed in the patched SAGE Unlocked (its scheduler kept data on its own code page). |
@@ -37,6 +37,32 @@ its own serial (`ergc` registry value); the setup script takes it as an argument
 Every change inside `game.dat` is checked against the expected bytes first and skipped if they differ, so another
 game version loses those corrections instead of crashing. Plain CrossOver without NotProton has not been tried.
 
+## Installing
+
+1. Install the game with the All in One Launcher in any CrossOver bottle or NotProton prefix and let it install
+   Patch 1.09 and the DirectX 9 runtime.
+2. Get this folder (`git clone`, or the source zip of a release) and put the prebuilt DLLs into it: unzip
+   `bfme2-mac-binaries.zip` from the [latest release](https://github.com/salexpro/bfme2-mac/releases/latest) inside
+   the folder. (Or build them: `letterbox/build.sh` and `sage-unlocked/build.sh`, which need
+   [uv](https://docs.astral.sh/uv/).)
+3. Add `lotrbfme2.exe` to Steam as a non-Steam game, force the NotProton FEX tool for it, and set the launch options
+   to `"<path to this folder>/bfme2-fex.sh" %command%`.
+4. Start it once. The wrapper refuses to start the game in a prefix that is not prepared and shows Wine's About box
+   instead; close it.
+5. Run `setup/setup-prefix.sh`. It finds the prefix of that launch, the game's serial and Microsoft's `d3dx9_27.dll`
+   (both in the prefix the launcher installed into) by itself; `--check` only shows what it would use.
+6. Start the game from Steam.
+
+The art and HUD for your screen's shape are built from your own game files at the first start when
+[uv](https://docs.astral.sh/uv/) is installed (`widescreen-art/out/<shape>/`; by hand:
+`uv run --with pillow python widescreen-art/make-art.py <game folder> widescreen-art/out/16x9`, or
+`... widescreen-art/out/a1594 1728/1084` for another shape). Without a set for a shape other than 16:9 the wrapper
+uses a 16:9 picture. An empty file `widescreen-art/disabled` goes without the art.
+
+Two Macs that are to play each other on a LAN need different serials: give the second one its own
+(`setup/setup-prefix.sh auto <serial>`). `setup/copy-to-another-mac.sh` copies the game and this folder to a second
+Mac over SSH and does steps 3-5 there.
+
 ## Layout
 
 ```
@@ -44,37 +70,14 @@ bfme2-fex.sh            launch wrapper (Steam launch options:  "<path>/bfme2-fex
 options-template.ini    first Options.ini for a new prefix
 letterbox/              the d3d9.dll proxy: letterbox.c, letterbox.ini (all settings, commented), build.sh
 sage-unlocked/          SAGE Unlocked v1.9.6 source, the patched Unlocker.cs, bfme2-fex.patch, build.sh
-transfer/               prefix-setup.reg, setup-prefix.sh (prepare a prefix), push-to-mac.sh (copy to another Mac)
+setup/                  setup-prefix.sh + prefix-setup.reg (prepare the prefix), copy-to-another-mac.sh
 widescreen-art/         make-art.py (logo, loading screen and HUD overrides per picture shape, from your own files),
-                        hud.py (the HUD for any shape), loading-screen/ (see above)
+                        hud.py (the HUD for any shape), loading-screen/ (the 16:9 loading pictures)
 env.sh, *.sh in the root   test aids that drive the game through the proxy (see below)
 ```
 
-## Installing
-
-1. Install the game with the All in One Launcher in any CrossOver bottle or NotProton prefix and let it install
-   Patch 1.09 and the DirectX 9 runtime.
-2. Build the binaries: `letterbox/build.sh` and `sage-unlocked/build.sh` (need [uv](https://docs.astral.sh/uv/);
-   the C# part is compiled with the Wine Mono that ships in the runner).
-3. Copy Microsoft's 32-bit `d3dx9_27.dll` (from the launcher's bottle: `windows/syswow64/d3dx9_27.dll`) to
-   `transfer/d3dx9_27.dll`. It is not included here.
-4. Add `lotrbfme2.exe` to Steam as a non-Steam game, force the NotProton FEX tool, and set the launch options to
-   `"<path to this folder>/bfme2-fex.sh" %command%`.
-5. Start it once. The wrapper refuses to start the game until the prefix is prepared and shows Wine's About box
-   instead; close it.
-6. Run `transfer/setup-prefix.sh <shortcut appid> <serial> [game folder]`. It imports `prefix-setup.reg`, installs
-   `d3dx9_27.dll` and links `C:\BFME2` to the game folder.
-7. Art and HUD sets are kept per picture shape in `widescreen-art/out/<shape>/` (`16x9`, `a1594` for 1728x1084, ...).
-   The wrapper builds a missing one at start when `uv` is installed; by hand:
-   `uv run --with pillow python widescreen-art/make-art.py <game folder> widescreen-art/out/16x9` or, for another
-   shape, `... widescreen-art/out/a1594 1728/1084`. Without a set for a shape other than 16:9 the wrapper uses a 16:9
-   picture. An empty file `widescreen-art/disabled` goes without the art.
-8. Start the game from Steam.
-
-`transfer/push-to-mac.sh` does steps 4-6 on a second Mac over SSH.
-
 Paths that differ per machine are not in the scripts. The launch wrapper takes the game folder from Steam's launch
-command; the test aids and `push-to-mac.sh` read `local.conf` in this folder (not tracked, see `env.sh`):
+command; the test aids and `copy-to-another-mac.sh` read `local.conf` in this folder (not tracked, see `env.sh`):
 
 ```
 BFME_GAME="<folder with lotrbfme2.exe>"

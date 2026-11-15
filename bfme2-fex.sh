@@ -84,6 +84,9 @@ if [ "${1:-}" = "--selftest" ]; then   # bfme2-fex.sh --selftest : show what wou
   exit 0
 fi
 
+# note the prefix and game folder of this launch for setup/setup-prefix.sh
+[ -n "${STEAM_COMPAT_DATA_PATH:-}" ] && printf 'LAST_COMPAT=%q\nLAST_GAME=%q\n' "$STEAM_COMPAT_DATA_PATH" "$GAME" > "$T/.last-launch" 2>/dev/null
+
 RES=""; FPS=""; INSET=""; HZ=""; VALIGN=""
 D=$(read_display)
 if [[ "$D" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]]; then
