@@ -1365,6 +1365,64 @@ static void draw_fps(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb)
     }
 }
 
+/* ---- SetThreadPriority, answered locally when nothing changes ----
+ * The game's asset streamer (0xa37e50) sets its loader thread's priority at the end of every pump:
+ * SetThreadPriority(thread, queue longer than a threshold ? NORMAL : BELOW_NORMAL). In a network game, a machine that
+ * has fallen behind the other one (after a hitch) pumps the streamer thousands of times per logic tick while it catches
+ * up, always with the same value. On Windows that call is nearly free. Under Wine every call is a round trip to the
+ * wineserver: measured 100,000 calls in 6 s, most of every tick, so the machine stood still ~170 ms per tick, could
+ * not run ticks faster than the other machine and never caught up (5 fps on the faster Mac, 14 on the slower, for
+ * minutes). A repeat of the last value for the same handle within a second is answered here without the call. */
+static DWORD g_prio_skipped;
+static BOOL WINAPI h_SetThreadPriority(HANDLE h, int prio)
+{
+    static struct { HANDLE h; int prio; DWORD tick; } last[8];
+    static volatile LONG busy;
+    DWORD now = GetTickCount();
+    int i, slot = 0;
+    BOOL r;
+    if (InterlockedExchange(&busy, 1)) return SetThreadPriority(h, prio);      /* another thread is in here: just do it */
+    for (i = 0; i < 8; i++)
+    {
+        if (last[i].h == h)
+        {
+            if (last[i].prio == prio && now - last[i].tick < 1000)
+            {
+                /* diagnostic: when these repeats come in a flood, write down who is asking (return addresses on the stack) */
+                static DWORD win_tick, win_n, said;
+                g_prio_skipped++;
+                if (now - win_tick > 1000) { win_tick = now; win_n = 0; }
+                if (++win_n == 20000 && said < 3)
+                {
+                    char line[420]; int n = 0, k; DWORD *sp = (DWORD *)&h;
+                    said++; line[0] = 0;
+                    for (k = 0; k < 400 && n < 380; k++)
+                    {
+                        DWORD v;
+                        if (IsBadReadPtr(sp + k, 4)) break;
+                        v = sp[k];
+                        if (v > 0x401005 && v < 0xbc0000 && !IsBadReadPtr((void *)(ULONG_PTR)(v - 6), 6))
+                        {
+                            const BYTE *c = (const BYTE *)(ULONG_PTR)v;
+                            if (c[-5] == 0xE8 || (c[-2] == 0xFF && (c[-1] & 0x38) == 0x10) || (c[-3] == 0xFF && (c[-2] & 0x38) == 0x10) || (c[-6] == 0xFF && (c[-5] & 0x38) == 0x10))
+                                n += wsprintfA(line + n, " %08x", v);
+                        }
+                    }
+                    logf("  SetThreadPriority flood: callers on the stack:%s", line);
+                }
+                InterlockedExchange(&busy, 0); return TRUE;
+            }
+            slot = i; break;
+        }
+        if (now - last[i].tick > now - last[slot].tick) slot = i;                /* otherwise reuse the oldest entry */
+    }
+    last[slot].h = h; last[slot].prio = prio; last[slot].tick = now;
+    InterlockedExchange(&busy, 0);
+    r = SetThreadPriority(h, prio);
+    if (!r) { last[slot].h = NULL; }
+    return r;
+}
+
 /* ---- where the game thread waits ----
  * A frame that stands still for a long time before it starts to draw is waiting for something (the other player's
  * data in a network game, a timer). The game's own Sleep, WaitForSingleObject and select calls on the game thread are
@@ -1419,7 +1477,7 @@ static void waits_report(DWORD before_scene_us)
         if (g_waits[i].calls && g_waits[i].us >= 2000)
             n += wsprintfA(line + n, " %s from %08x: %u ms in %u calls;", g_waits[i].kind == 'S' ? "Sleep" : g_waits[i].kind == 'W' ? "WaitForSingleObject" : "select",
                            g_waits[i].ra, g_waits[i].us / 1000, g_waits[i].calls);
-    logf("    stood still %u ms before drawing. waits:%s | phase %d of %d, net factor bits %08x, limiter flag %u", before_scene_us / 1000,
+    logf("    stood still %u ms before drawing (repeated SetThreadPriority calls answered locally so far: %u). waits:%s | phase %d of %d, net factor bits %08x, limiter flag %u", before_scene_us / 1000, g_prio_skipped,
          n ? line : " none of the three kinds (busy, or another kind of wait)",
          eng && !IsBadReadPtr(eng + 0x38, 4) ? *(int *)(eng + 0x34) : -1, eng && !IsBadReadPtr(eng + 0x38, 4) ? *(int *)(eng + 0x38) : -1,
          *(DWORD *)0xd9f498, (UINT)*(BYTE *)0xde4320);
@@ -1503,6 +1561,7 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
             g_sync_waits = g_sync_wait_us = g_sync_late_work = g_sync_late_wait = g_sync_work_max = g_sync_sleeps = g_vt_skips = g_vt_resyncs = g_vt_lim_pushed = 0;
         }
         if (g_fast_filters || g_slow_filters) { logf("  mip filters this window: %u fast, %u through d3dx", g_fast_filters, g_slow_filters); g_fast_filters = g_slow_filters = 0; }
+        { static DWORD prio_said; if (g_prio_skipped != prio_said) { logf("  repeated SetThreadPriority calls answered locally: %u in this window", g_prio_skipped - prio_said); prio_said = g_prio_skipped; } }
         ZeroMemory(&st, sizeof(st));
         t0 = now; frames = 0; max_us = 0;
     }
@@ -1770,6 +1829,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
         iat_hook(exe, "user32.dll", "GetCursorPos", h_GetCursorPos);
         iat_hook(exe, "user32.dll", "SetCursorPos", h_SetCursorPos);
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
+        iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);
         iat_hook(exe, "kernel32.dll", "Sleep", h_Sleep);                               /* wait recorder, see waits_report */
         iat_hook(exe, "kernel32.dll", "WaitForSingleObject", h_WaitForSingleObject);
         {
