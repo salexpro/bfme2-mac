@@ -2,6 +2,7 @@
 """Build the 16:9 art overrides for BFME II from the user's own game files (nothing from the game is shipped here).
 
     uv run --with pillow python make-art.py <game folder> <output folder> [aspect, default 16/9] [language, default english]
+    uv run --with pillow python make-art.py --extract <name inside the archives> <game folder> <output file>
 
 Writes into the output folder:
   !widescreen-art.big   a small archive that the game loads before all others ('!' sorts first, first copy of a file
@@ -9,7 +10,9 @@ Writes into the output folder:
                         loading screen (lo\\load_w_ea.jpg) and the title screen (ti\\titlescreenuserinterface.jpg) squeezed horizontally by
                         (4/3)/aspect, so that they have their real proportions again once the game stretches its 4:3
                         layout over a wide picture.
-The small splash window shown before the game starts (EnglishSplash.jpg, 800x600) is left alone.
+  root/<language>splash.jpg   only if custom/<language>splash.jpg exists: an enhanced copy, same size, of the small
+                        picture shown before the game starts.
+A finished wide loading screen can be supplied as custom/load_w_ea-16x9.png (see loading-screen/).
 """
 import io, os, shutil, struct, sys
 from PIL import Image
@@ -36,6 +39,17 @@ def find_in_bigs(game, wanted):
                     f.seek(off); return name, f.read(size), b
     return None, None, None
 
+def find_effective(game, wanted, language='english'):
+    """the copy the game ends up using: language archives (lang/<language>*.big, the last one wins) go over the root ones"""
+    lang = os.path.join(game, 'lang'); hit = (None, None, None)
+    if os.path.isdir(lang):
+        for b in sorted(x for x in os.listdir(lang) if x.lower().startswith(language) and x.lower().endswith('.big') and 'widescreen' not in x.lower()):
+            for name, off, size in big_entries(os.path.join(lang, b)):
+                if name.lower() == wanted.lower():
+                    with open(os.path.join(lang, b), 'rb') as f:
+                        f.seek(off); hit = (name, f.read(size), 'lang/' + b)
+    return hit if hit[1] else find_in_bigs(game, wanted)
+
 def write_big(path, files):
     table = b''; data = b''; first = 16 + sum(8 + len(n.encode('latin1')) + 1 for n, _ in files)
     for name, blob in files:
@@ -44,6 +58,10 @@ def write_big(path, files):
         f.write(b'BIGF' + struct.pack('<I', first + len(data)) + struct.pack('>II', len(files), first) + table + data)
 
 def main():
+    if sys.argv[1] == '--extract':      # make-art.py --extract <file name inside the archives> <game folder> <output file>
+        name, blob, src = find_effective(sys.argv[3], sys.argv[2])
+        if not blob: sys.exit('not found: ' + sys.argv[2])
+        open(sys.argv[4], 'wb').write(blob); print('%s from %s' % (name, src)); return
     game, out = sys.argv[1], sys.argv[2]
     aspect = eval(sys.argv[3]) if len(sys.argv) > 3 else 16 / 9
     language = (sys.argv[4] if len(sys.argv) > 4 else 'english').lower()     # the game's language (registry "Language")
@@ -51,7 +69,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     if k < 0.999:
         files = []
-        name, blob, src = find_in_bigs(game, 'art\\compiledtextures\\lo\\logowithshadow.tga')
+        name, blob, src = find_effective(game, 'art\\compiledtextures\\lo\\logowithshadow.tga', language)
         if blob:
             im = Image.open(io.BytesIO(blob)).convert('RGBA')
             w, h = im.size; nw = max(1, round(w * k))
@@ -64,10 +82,22 @@ def main():
         # full-screen 4:3 pictures the game stretches over the whole picture: the start-up loading screen (the one with
         # the legal text) and the title screen behind the user interface
         for wanted in ('art\\compiledtextures\\lo\\load_w_ea.jpg', 'art\\compiledtextures\\ti\\titlescreenuserinterface.jpg'):
-            name, blob, src = find_in_bigs(game, wanted)
+            name, blob, src = find_effective(game, wanted, language)
             if not blob: continue
             im = Image.open(io.BytesIO(blob)).convert('RGB')
             w, h = im.size; nw = max(1, round(w * k))
+            # custom/<name>-16x9.png next to this script: a finished wide version of that picture (see loading-screen/).
+            # It fills the whole screen; without one the original is squeezed and gets black sides.
+            custom = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'custom', os.path.splitext(wanted.split('\\')[-1])[0] + '-16x9.png')
+            if os.path.exists(custom) and abs(aspect - 16 / 9) < 0.02 and w == h:
+                c = Image.open(custom).convert('RGB')
+                size = int(os.environ.get('BFME_ART_SIZE', 2048 if c.height >= 1536 else 1024))    # texture edge, power of two
+                canvas = Image.new('RGB', (size, size), (0, 0, 0))                                 # picture = top three quarters
+                canvas.paste(c.resize((size, size * 3 // 4), Image.LANCZOS), (0, 0))
+                buf = io.BytesIO(); canvas.save(buf, format='JPEG', quality=93, subsampling=0)
+                files.append((name, buf.getvalue()))
+                print('%s: custom wide picture %dx%d -> %dx%d texture' % (name.split('\\')[-1], c.width, c.height, size, size))
+                continue
             canvas = Image.new('RGB', (w, h), (0, 0, 0))
             canvas.paste(im.resize((nw, h), Image.LANCZOS), ((w - nw) // 2, 0))
             buf = io.BytesIO(); canvas.save(buf, format='JPEG', quality=92)
@@ -80,5 +110,16 @@ def main():
             os.makedirs(os.path.join(out, 'lang'), exist_ok=True)
             write_big(os.path.join(out, 'lang', language + 'zz-widescreen-art.big'), files)
             print('-> !widescreen-art.big and lang/%szz-widescreen-art.big (%d files each)' % (language, len(files)))
+    # custom/<language>splash.jpg: an enhanced copy of the small picture shown before the game starts. It has to keep
+    # the original's pixel size (the window is that size). Goes to out/root/, which the launch wrapper copies to the game.
+    here = os.path.dirname(os.path.abspath(__file__)); n = language + 'splash.jpg'
+    cs = os.path.join(here, 'custom', n); gs = next((os.path.join(game, f) for f in os.listdir(game) if f.lower() == n), None)
+    if os.path.exists(cs) and gs:
+        orig = os.path.join(out, language + 'splash-original.jpg')
+        if not os.path.exists(orig): shutil.copyfile(gs, orig)
+        if Image.open(cs).size == Image.open(orig).size:
+            os.makedirs(os.path.join(out, 'root'), exist_ok=True); shutil.copyfile(cs, os.path.join(out, 'root', os.path.basename(gs)))
+            print('-> root/%s (enhanced splash, same size)' % os.path.basename(gs))
+        else: print('custom splash ignored: not the size of the original')
 
 if __name__ == '__main__': main()

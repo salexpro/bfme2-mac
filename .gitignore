@@ -7,6 +7,7 @@
 *.bak*
 shots/
 display-override.conf
+local.conf
 sage-unlocked/disabled
 # intermediate copies of the patched SAGE Unlocked source (the current one is source-fexfix4)
 sage-unlocked/source-fexfix/
@@ -15,6 +16,7 @@ sage-unlocked/source-fexfix3/
 # per-machine or not redistributable: a serial, Microsoft's d3dx9_27.dll, art built from the game's files
 transfer/ergc-*.txt
 widescreen-art/out/
+widescreen-art/custom/
 # earlier experiments that are not part of this setup
 bfme2.sh
 dgvoodoo-override.reg

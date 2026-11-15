@@ -1,7 +1,6 @@
 #!/bin/bash
 # Test aid: in a skirmish select a starting builder and record the brightness around it (the selection ring's throb).
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
-G="${BFME_GAME:-$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2}"
+. "$(dirname "$0")/env.sh"
 "$T/enter-skirmish.sh" >/dev/null 2>&1
 read -r W H <<< "$(tr -d '\r' < "$G/letterbox.log" | sed -n 's/^letterbox on: game \([0-9]*\)x\([0-9]*\) .*/\1 \2/p' | tail -1)"
 F=${1:-120}

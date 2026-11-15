@@ -1,8 +1,7 @@
 #!/bin/bash
 # Test aid: print the engine's phase and drawn-interpolation value for 72 consecutive frames (needs SAGE Unlocked active).
 # Smooth = within each tick the value climbs evenly to 1.00 on the last frame, then restarts near 0.
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
-G="${BFME_GAME:-$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2}"
+. "$(dirname "$0")/env.sh"
 L="$G/letterbox.log"
 last() { tr -d '\r' < "$L" | grep -i "^peek 0*$1:" | tail -1; }
 "$T/drive.sh" cmd "peek 632601 2"; sleep 2

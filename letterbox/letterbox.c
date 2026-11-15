@@ -1112,6 +1112,13 @@ static void patch_selection_ring(void)
  *    angle is widened by (shape / 4:3): the height shown is what the game was designed for at 4:3 and the extra width
  *    is added at the sides. Culling, picking and scrolling limits all come from the same camera. */
 static int cfg_horplus = 1;
+/* 8. Network games. The frame limiter multiplies the frame rate by a factor ([0xd9f498], 0.7 .. 1.0) that the game lowers
+ *    while its network run-ahead buffer is empty (set once per tick at 0x63a06e ff.). At the original 30 fps that slowed
+ *    the game logic down together with the frames. With the frame-rate unlock the logic keeps its own pace and waits for
+ *    the network by itself, so the factor only costs drawn frames: the machine that waits for the other one in a match
+ *    ran at about 0.7 x its cap (43 fps at a 60 cap). netfps=1 makes the limiter use 1.0. */
+static int cfg_netfps = 1;
+__attribute__((used)) static float k_one = 1.0f;
 static int cfg_steamoverlay = 0;   /* steamoverlay=1: load NotProton's Steam bridge into the game so the Steam overlay (FPS counter) can attach */
 double tan(double); double atan(double);     /* from the C runtime; <math.h> is not included because it declares logf() */
 typedef void (__attribute__((thiscall)) *set_view_plane_fn)(void *cam, float hfov, float vfov);
@@ -1152,6 +1159,13 @@ static void patch_game_code(void)
         if (cfg_logicinterp) for (i = 0; i < 4; i++) if (retarget_call(interp_sites[i], 0x63256f, h_SetLogicInterp)) m++;
         logf("logic-side interpolation fraction phase/6: %d of 4 places", m);
         if (cfg_ringtiming) patch_selection_ring();
+        if (cfg_netfps)
+        {
+            static const BYTE fmul_net[6] = { 0xD8, 0x0D, 0x98, 0xF4, 0xD9, 0x00 };      /* fmul dword [0xd9f498] */
+            BYTE r[6]; DWORD a = (DWORD)(ULONG_PTR)&k_one;
+            r[0] = 0xD8; r[1] = 0x0D; memcpy(r + 2, &a, 4);
+            logf("network frame-rate throttle: %s", patch_bytes(0x63a1a1, fmul_net, r, 6) ? "off" : "NOT changed (unexpected code)");
+        }
         if (cfg_firstphase)
         {
             static const DWORD fp_sites[] = { 0x461ebd, 0x48e2d3, 0x4b51f4, 0x4b6be6, 0x4ed6ab, 0x64871c, 0x6487f3, 0x6759bb, 0x83ba12, 0x8a036e };
@@ -1588,6 +1602,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
+            cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
             cfg_realframelen = (int)GetPrivateProfileIntW(L"letterbox", L"realframelen", 1, ini);
             cfg_sync = (int)GetPrivateProfileIntW(L"letterbox", L"syncpresent", -1, ini);
             cfg_refresh = GetPrivateProfileIntW(L"letterbox", L"refresh", 0, ini);

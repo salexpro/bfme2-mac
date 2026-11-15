@@ -2,8 +2,8 @@
 # Test automation for BFME II through the letterbox d3d9.dll (see letterbox.c "test automation").
 #   drive.sh cmd "click 400 1500" "wait 30" ...   send command lines
 #   drive.sh shot <name>                           take a frame, convert to <scratch>/<name>.jpg, print the path
-G="${BFME_GAME:-$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2}"
-OUT="${BFME_SHOTS:-$(cd "$(dirname "$0")" && pwd)/shots}"
+. "$(dirname "$0")/env.sh"
+OUT="$BFME_SHOTS"
 mkdir -p "$OUT"
 case "$1" in
   cmd) shift; for i in $(seq 1 100); do [ -e "$G/letterbox.cmd" ] || break; sleep 0.2; done

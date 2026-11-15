@@ -1,8 +1,7 @@
 #!/bin/bash
 # Test aid: measure the running game's logic tick rate (normal = about 5 per second) through the letterbox d3d9.dll's
 # peek/watch commands. Needs SAGE Unlocked active (it finds the engine object through the unlocker's scheduler hook).
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
-G="${BFME_GAME:-$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2}"
+. "$(dirname "$0")/env.sh"
 L="$G/letterbox.log"
 last() { tr -d '\r' < "$L" | grep -i "^peek 0*$1:" | tail -1; }
 BFME_GAME="$G" "$T/drive.sh" cmd "peek 632601 2"; sleep 2

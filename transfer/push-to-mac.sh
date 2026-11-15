@@ -1,33 +1,41 @@
 #!/bin/bash
-# Run on the Mac Studio: copy BFME II and this whole setup to another Mac over SSH and register it in that Mac's Steam
-# as a non-Steam shortcut on the NotProton FEX runner (same appid as here, 2596813934).
+# Run on a Mac that is already set up: copy BFME II and this whole folder to another Mac over SSH and register the game
+# in that Mac's Steam as a non-Steam shortcut on the NotProton FEX runner.
 #   push-to-mac.sh <user@host> <ergc-key> files      copy the game (6.3 GB) and the tools
 #   push-to-mac.sh <user@host> <ergc-key> steam      add the Steam shortcut + compatibility tool + artwork (quits and restarts Steam there)
 #   push-to-mac.sh <user@host> <ergc-key> prefix     first launch (creates the prefix; shows Wine's About box), then set the prefix up
 # The other Mac needs: Steam signed in, NotProton with the notproton-fex-41073 tool, Remote Login with this Mac's key.
+# Settings (environment or local.conf in this folder's parent, see env.sh): BFME_GAME = the game folder on this Mac;
+# optional BFME_APPID (the shortcut's appid, any id Steam does not use yet) and BFME_ICON (a .png for the shortcut).
 set -u
 DEST="${1:?user@host}"; KEY="${2:?ergc key}"; STAGE="${3:?files|steam|prefix}"
-APPID=2596813934; GAMEID=11153230920360656896
-T="$HOME/Library/Application Support/ClaudeGameTools"
-SRC_GAME="$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2"
+TOOLS="$(cd "$(dirname "$0")/.." && pwd)"                       # this repository
+[ -f "$TOOLS/local.conf" ] && . "$TOOLS/local.conf"
+SRC_GAME="${BFME_GAME:?set BFME_GAME (the game folder on this Mac) in local.conf}"
+APPID="${BFME_APPID:-2596813934}"
+GAMEID=$(printf '%u' $(( (APPID << 32) | 0x02000000 )))          # Steam's game id of a non-Steam shortcut
+ICON="${BFME_ICON:-}"
 S='ssh -o BatchMode=yes -o ConnectTimeout=10'
 RHOME=$($S "$DEST" 'printf %s "$HOME"') || { echo "cannot reach $DEST"; exit 1; }
-RT="$RHOME/Library/Application Support/ClaudeGameTools"
+RT="$RHOME${TOOLS#"$HOME"}"                                     # the same place under the other Mac's home
 RGAME="$RHOME/Library/Application Support/Steam/steamapps/common/BFME2"
 RSTEAM="$RHOME/Library/Application Support/Steam"
 q() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }   # quote for the remote shell
 
 case "$STAGE" in
 files)
-  $S "$DEST" "mkdir -p $(q "$RGAME") $(q "$RT/bfme2") $(q "$RT/bfme") && ls $(q "$RHOME/Library/Application Support/Steam/compatibilitytools.d") | grep -c notproton-fex-41073" | sed 's/^/notproton-fex-41073 tool present: /'
+  $S "$DEST" "mkdir -p $(q "$RGAME") $(q "$RT") && ls $(q "$RHOME/Library/Application Support/Steam/compatibilitytools.d") | grep -c notproton-fex-41073" | sed 's/^/notproton-fex-41073 tool present: /'
   echo "copying the game ..."
   tar -C "$SRC_GAME" --exclude './letterbox.log' --exclude './letterbox.cmd' --exclude './SAGEUnlocked.log' --exclude './*.bmp' -cf - . | $S "$DEST" "tar -C $(q "$RGAME") -xf -" || exit 1
   echo "copying the tools ..."
-  tar -C "$T/bfme2" -cf - bfme2-fex.sh options-template.ini drive.sh enter-skirmish.sh tickrate.sh letterbox/d3d9.dll letterbox/letterbox.ini letterbox/letterbox.c \
-      sage-unlocked/files sage-unlocked/README.txt sage-unlocked/source-fexfix2 transfer/prefix-setup.reg transfer/d3dx9_27.dll transfer/setup-prefix.sh \
-    | $S "$DEST" "tar -C $(q "$RT/bfme2") -xf -" || exit 1
-  tar -C "$T/bfme" -cf - bfme2_icon.png | $S "$DEST" "tar -C $(q "$RT/bfme") -xf -"
-  $S "$DEST" "du -sh $(q "$RGAME") | cut -f1; ls $(q "$RT/bfme2"); xattr -dr com.apple.quarantine $(q "$RT/bfme2") 2>/dev/null; true"
+  tar -C "$TOOLS" --exclude './.git' --exclude './shots' --exclude '*.bak*' --exclude '*.log' --exclude './transfer/ergc-*' \
+      --exclude './display-override.conf' --exclude './local.conf' --exclude './widescreen-art/custom' \
+      --exclude './sage-unlocked/source-fexfix' --exclude './sage-unlocked/source-fexfix2' --exclude './sage-unlocked/source-fexfix3' \
+      -cf - . | $S "$DEST" "tar -C $(q "$RT") -xf -" || exit 1
+  [ -f "$ICON" ] && cat "$ICON" | $S "$DEST" "cat > $(q "$RT/shortcut-icon.png")"
+  printf 'BFME_GAME="%s"\nBFME_COMPAT="%s"\nBFME_URL="steam://rungameid/%s"\n' "$RGAME" "$RSTEAM/steamapps/compatdata/$APPID" "$GAMEID" \
+    | $S "$DEST" "cat > $(q "$RT/local.conf")"                  # settings for the test scripts over there
+  $S "$DEST" "du -sh $(q "$RGAME") | cut -f1; ls $(q "$RT"); xattr -dr com.apple.quarantine $(q "$RT") 2>/dev/null; true"
   ;;
 steam)
   UD=$($S "$DEST" "ls -d $(q "$RSTEAM")/userdata/*/config/shortcuts.vdf 2>/dev/null | head -5")
@@ -40,17 +48,17 @@ steam)
   scp -q "$DEST:$(printf %q "$UD")" "$W/shortcuts.vdf" || scp -q "$DEST:\"$UD\"" "$W/shortcuts.vdf" || exit 1
   scp -q "$DEST:$(printf %q "$RSTEAM/config/config.vdf")" "$W/config.vdf" || scp -q "$DEST:\"$RSTEAM/config/config.vdf\"" "$W/config.vdf" || exit 1
   cp "$W/shortcuts.vdf" "$W/shortcuts.vdf.orig"; cp "$W/config.vdf" "$W/config.vdf.orig"
-  uv run -q --with vdf python -I - "$W" "$RHOME" "$APPID" <<'PY' || exit 1
+  uv run -q --with vdf python -I - "$W" "$RHOME" "$APPID" "$RT" "$([ -f "$ICON" ] && echo 1 || echo 0)" <<'PY' || exit 1
 import sys, vdf, re, struct
-w, rhome, appid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+w, rhome, appid, rt, icon = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5] == '1'
 signed = struct.unpack('<i', struct.pack('<I', appid))[0]
 p = w + '/shortcuts.vdf'
 d = vdf.binary_load(open(p, 'rb'))
 sc = d.setdefault('shortcuts', {})
 game = rhome + '/Library/Application Support/Steam/steamapps/common/BFME2'
 entry = {'appid': signed, 'AppName': 'The Battle for Middle-earth II', 'Exe': '"%s/lotrbfme2.exe"' % game, 'StartDir': '"%s/"' % game,
-         'icon': rhome + '/Library/Application Support/ClaudeGameTools/bfme/bfme2_icon.png', 'ShortcutPath': '',
-         'LaunchOptions': '"%s/Library/Application Support/ClaudeGameTools/bfme2/bfme2-fex.sh" %%command%%' % rhome,
+         'icon': rt + '/shortcut-icon.png' if icon else '', 'ShortcutPath': '',
+         'LaunchOptions': '"%s/bfme2-fex.sh" %%command%%' % rt,
          'IsHidden': 0, 'AllowDesktopConfig': 1, 'AllowOverlay': 1, 'OpenVR': 0, 'Devkit': 0, 'DevkitGameID': '', 'DevkitOverrideAppID': 0,
          'LastPlayTime': 0, 'FlatpakAppID': '', 'sortas': '', 'tags': {}}
 key = next((k for k, e in sc.items() if (e.get('appid', 0) & 0xffffffff) == appid), None)
@@ -77,8 +85,8 @@ PY
   echo "working copies kept in $W"
   ;;
 prefix)
-  $S "$DEST" "open 'steam://rungameid/$GAMEID'; for i in \$(seq 1 120); do [ -f $(q "$RSTEAM/steamapps/compatdata/$APPID/pfx/system.reg") ] && pgrep -f winver >/dev/null && break; sleep 1; done; sleep 4; pkill -f winver; sleep 6; tail -3 $(q "$RT/bfme2/bfme2-fex.log")"
-  $S "$DEST" "$(q "$RT/bfme2/transfer/setup-prefix.sh") $APPID $(q "$KEY")"
+  $S "$DEST" "open 'steam://rungameid/$GAMEID'; for i in \$(seq 1 120); do [ -f $(q "$RSTEAM/steamapps/compatdata/$APPID/pfx/system.reg") ] && pgrep -f winver >/dev/null && break; sleep 1; done; sleep 4; pkill -f winver; sleep 6; tail -3 $(q "$RT/bfme2-fex.log")"
+  $S "$DEST" "$(q "$RT/transfer/setup-prefix.sh") $APPID $(q "$KEY")"
   ;;
 *) echo "stage?"; exit 2 ;;
 esac

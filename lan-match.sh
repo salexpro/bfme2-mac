@@ -1,9 +1,11 @@
 #!/bin/bash
-# Test automation (run on the Mac Studio): start a 2-player LAN match, the Studio hosting and another Mac joining.
+# Test automation: start a 2-player LAN match, this Mac hosting and another Mac (set up the same way) joining.
 #   lan-match.sh <user@host>        e.g. lan-match.sh user@other-mac.local
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
+. "$(dirname "$0")/env.sh"
 DEST="${1:?user@host}"
-other() { ssh -o BatchMode=yes "$DEST" "cd \"\$HOME/Library/Application Support/ClaudeGameTools/bfme2\" && export BFME_GAME=\"\$HOME/Library/Application Support/Steam/steamapps/common/BFME2\" BFME_COMPAT=\"\$HOME/Library/Application Support/Steam/steamapps/compatdata/2596813934\" BFME_SHOTS=/tmp/bfme2-shots && $1"; }
+# The other Mac has this folder in the same place under its home (or name it in BFME_REMOTE_TOOLS) with its own local.conf.
+RT="${BFME_REMOTE_TOOLS:-\$HOME${T#"$HOME"}}"
+other() { ssh -o BatchMode=yes "$DEST" "cd \"$RT\" && $1"; }
 at() { echo "$(( $1 * $3 / 10000 )) $(( $2 * $4 / 10000 ))"; }     # at W H fx fy
 other './lan-lobby.sh' > /tmp/bfme2-lan-other.txt 2>&1 &
 read -r W H <<< "$("$T/lan-lobby.sh" | tail -1)"; wait

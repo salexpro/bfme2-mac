@@ -20,7 +20,9 @@ No game files are included. You need your own installation of the game.
 | Uneven frame pacing (micro-stutter on steadily moving things) | While the Mac holds the refresh rate, frames are locked to the real buffer swap and the game gets a regular per-frame clock. |
 | 16:9 trims the top and bottom of what 4:3 shows | The camera's field of view is widened so the 4:3 height is kept and the sides are added (`horplus`). |
 | Round command buttons over buildings are ovals at 16:9 | Drawn round. |
+| In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
+| The loading screen is a 4:3 picture | Optional: `widescreen-art/loading-screen/` rebuilds it as a real 16:9 picture from a still of the film shot it was made from (you supply the still), carries the picture's own shading into the new sides and sharpens it with Real-ESRGAN. |
 
 Multiplayer on a LAN between two Macs set up this way works (lobby, join, matches stay in sync). Each machine needs
 its own serial (`ergc` registry value); the setup script takes it as an argument.
@@ -42,8 +44,8 @@ options-template.ini    first Options.ini for a new prefix
 letterbox/              the d3d9.dll proxy: letterbox.c, letterbox.ini (all settings, commented), build.sh
 sage-unlocked/          SAGE Unlocked v1.9.6 source, the patched Unlocker.cs, bfme2-fex.patch, build.sh
 transfer/               prefix-setup.reg, setup-prefix.sh (prepare a prefix), push-to-mac.sh (copy to another Mac)
-widescreen-art/         make-art.py (16:9 logo / loading screen overrides from your own files)
-*.sh in the root        test aids that drive the game through the proxy (see below)
+widescreen-art/         make-art.py (16:9 logo / loading screen overrides from your own files), loading-screen/ (see above)
+env.sh, *.sh in the root   test aids that drive the game through the proxy (see below)
 ```
 
 ## Installing
@@ -65,6 +67,15 @@ widescreen-art/         make-art.py (16:9 logo / loading screen overrides from y
 
 `transfer/push-to-mac.sh` does steps 4-6 on a second Mac over SSH.
 
+Paths that differ per machine are not in the scripts. The launch wrapper takes the game folder from Steam's launch
+command; the test aids and `push-to-mac.sh` read `local.conf` in this folder (not tracked, see `env.sh`):
+
+```
+BFME_GAME="<folder with lotrbfme2.exe>"
+BFME_COMPAT="<Steam library>/steamapps/compatdata/<appid of the shortcut>"
+BFME_URL="steam://rungameid/<game id of the shortcut>"
+```
+
 ## Settings
 
 - `letterbox/letterbox.ini`: every switch of the proxy, each with a comment. `Ctrl+Shift+F` in the game toggles a
@@ -79,6 +90,11 @@ The proxy reads a command file (`letterbox.cmd` in the game folder): screenshots
 moves and clicks, a per-frame recorder (brightness, frame time), memory peeks. The scripts in the root use it:
 `enter-skirmish.sh`, `scroll-test.sh`, `tickrate.sh`, `interp-trace.sh`, `menu-rec.sh`, `select-rec.sh`,
 `ring-rec.sh`, `bring-rec.sh`, `lan-lobby.sh`, `lan-match.sh`. They need no screen-recording permission.
+
+## Licence
+
+GPL-3.0, see `LICENSE`. `sage-unlocked/` is derived from SAGE Unlocked (GPL-3.0); the rest is original work under the
+same licence. No game files, no artwork and no Microsoft files are included.
 
 ## Credits
 

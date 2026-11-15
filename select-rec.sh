@@ -1,7 +1,6 @@
 #!/bin/bash
 # Test aid: in a skirmish, record the brightness of the fortress area while selecting/deselecting it three times.
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
-G="${BFME_GAME:-$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2}"
+. "$(dirname "$0")/env.sh"
 "$T/enter-skirmish.sh" >/dev/null 2>&1
 read -r W H <<< "$(tr -d '\r' < "$G/letterbox.log" | sed -n 's/^letterbox on: game \([0-9]*\)x\([0-9]*\) .*/\1 \2/p' | tail -1)"
 F=${1:-120}     # frames per second, for the waits

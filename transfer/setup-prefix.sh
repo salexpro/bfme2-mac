@@ -9,7 +9,7 @@ APPID="${1:?appid}"; KEY="${2:?ergc key}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 GAME="${3:-$HOME/Library/Application Support/Steam/steamapps/common/BFME2}"
 PFX="$HOME/Library/Application Support/Steam/steamapps/compatdata/$APPID/pfx"
-R="$HOME/Library/Application Support/notproton/runners/crossover-27.0.0.41073-fex/CrossOver"
+R="${BFME_RUNNER:-$HOME/Library/Application Support/notproton/runners/crossover-27.0.0.41073-fex/CrossOver}"   # NotProton's FEX runner
 W="$R/lib/wine/aarch64-unix/wine.app/Contents/MacOS/wine"
 [ -f "$PFX/system.reg" ] || { echo "no prefix at $PFX yet (launch the shortcut once first)"; exit 1; }
 [ -f "$GAME/game.dat" ] || { echo "no game at $GAME"; exit 1; }

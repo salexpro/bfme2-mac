@@ -18,7 +18,7 @@
 #    on this Mac's current LAN address.
 #    To pin values instead, create display-override.conf next to this file with any of:
 #        RES="1920 1080"     FPS=60     INSET=0     VALIGN=top   (picture right under the notch instead of centred)
-T="$HOME/Library/Application Support/ClaudeGameTools/bfme2"
+T="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # this folder
 LOG="$T/bfme2-fex.log"
 PFX="${STEAM_COMPAT_DATA_PATH:-/nonexistent}/pfx"
 REG="$PFX/user.reg"
@@ -27,7 +27,10 @@ say() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 # The game folder is wherever the lotrbfme2.exe that Steam is starting lives.
 GAME=""
 for a in "$@"; do case "$a" in */lotrbfme2.exe) GAME="${a%/*}" ;; esac; done
-[ -n "$GAME" ] && [ -d "$GAME" ] || GAME="$HOME/Library/Application Support/Steam/steamapps/compatdata/3308318774/pfx/drive_c/BFME2"
+if [ -z "$GAME" ] || [ ! -d "$GAME" ]; then                   # not in the command: BFME_GAME from local.conf (see env.sh)
+  [ -f "$T/local.conf" ] && . "$T/local.conf"; GAME="${BFME_GAME:-}"
+fi
+[ "${1:-}" = "--selftest" ] || [ -d "$GAME" ] || { say "no game folder (expected .../lotrbfme2.exe in the launch command); not starting"; exit 1; }
 HARMLESS="$PFX/drive_c/windows/system32/winver.exe"
 OPTDIR="$PFX/drive_c/users/crossover/AppData/Roaming/My Battle for Middle-earth II Files"
 
@@ -115,6 +118,7 @@ fi
 # to go without.
 for f in "$T/widescreen-art/out/!widescreen-art.big"; do [ -f "$f" ] && put "$f" "$(basename "$f")"; done
 for f in "$T/widescreen-art/out/lang"/*.big; do [ -f "$f" ] && put "$f" "lang/$(basename "$f")"; done
+for f in "$T/widescreen-art/out/root"/*; do [ -f "$f" ] && put "$f" "$(basename "$f")"; done   # enhanced pre-start splash
 # SAGE Unlocked (frame-rate unlock). An empty file sage-unlocked/disabled switches it off for A/B tests.
 if [ -e "$T/sage-unlocked/disabled" ]; then
   for f in dinput8.dll CnCFpsUnlocker.dll SAGEUnlocked.ini; do [ -e "$GAME/$f" ] && rm -f "$GAME/$f" && say "removed $f (SAGE Unlocked disabled)"; done
