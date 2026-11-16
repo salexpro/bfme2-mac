@@ -1472,7 +1472,7 @@ static class Program
         if (site.NetGlobal != 0 && On("catchup"))
         {
             // 2 or 3 ticks waiting: still behind, but below the engine's own catch-up threshold. Left alone it only closes
-            // by the 1 % this timetable runs fast (a tick per 20 s; the lag icon stays lit meanwhile). So the timetable
+            // by the 1 % this timetable runs fast (a tick per 20 s). So the timetable
             // runs at double speed until at most one tick is waiting: tickStart moves back by a frame length per frame.
             a.E(0x83, 0x3D); a.D(nready); a.E(0x01); a.J(0x7E, "level");
             a.E(0x29, 0x05); a.D(t0);                                // sub [tickStart],eax
