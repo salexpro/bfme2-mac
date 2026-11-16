@@ -2139,7 +2139,7 @@ __attribute__((naked)) static void h_SetViewPlane(void)    /* thiscall (camera; 
  * part of its game object at +4 (0 when the object is gone) and the game object itself at +A0h, whose position is
  * at +14h (x) and +24h (y), with a copy at +38h and +3Ch. The manager's update is a virtual function (0xb6c420,
  * the only pointer to it is the table entry at 0xd0bf30). That entry is pointed here: before every update the
- * list is walked, and a unit beyond +-100000 (maps are a few thousand wide) is handed to the manager's own
+ * list is walked, and a unit beyond +-100000 (maps are a few thousand wide; up to 256 units per update) is handed to the manager's own
  * "forget this object" routine (0xb6c480). The unit stays where it is, the collision manager just no longer
  * knows it; the log says which unit it was and where it stood the last time it moved. In a network game all
  * machines must run the same proxy, as for everything else that touches the game's logic. */
@@ -2157,7 +2157,8 @@ static int whole(float v)                  /* a float for wsprintf: whole units,
 }
 __attribute__((used)) static void __cdecl far_guard(DWORD mgr)
 {
-    DWORD work, rec, part[16], walked = 0, n = 0, i;
+    static DWORD part[256];
+    DWORD work, rec, walked = 0, n = 0, i;
     if (mgr < 0x10000) return;
     work = *(const DWORD *)(ULONG_PTR)(mgr + 0x10);
     if (work < 0x10000 || !*(const DWORD *)(ULONG_PTR)work) return;         /* the update itself does nothing then */
@@ -2166,16 +2167,19 @@ __attribute__((used)) static void __cdecl far_guard(DWORD mgr)
         DWORD pt = *(const DWORD *)(ULONG_PTR)(rec + 4), own = *(const DWORD *)(ULONG_PTR)(rec + 0xa0);
         struct far_slot *s = &g_far[(rec >> 3) & 2047];
         const DWORD *q;
-        float x, y;
+        float x, y, cx, cy;
         BOOL known;
         if (pt < 0x10000 || own < 0x10000) continue;
         q = (const DWORD *)(ULONG_PTR)own;
-        if (q[5] != q[14] || q[9] != q[15]) continue;         /* not a game object with its position where we expect it */
+        if (q[0] < g_code_hi || q[0] >= 0xe00000) continue;   /* a game object starts with a table of its functions inside game.dat */
         x = *(const float *)&q[5]; y = *(const float *)&q[9];
+        cx = *(const float *)&q[14]; cy = *(const float *)&q[15];        /* the copy; either one far away will do */
         known = s->rec == rec;
-        if (x != x || y != y || x > FAR_LIMIT || x < -FAR_LIMIT || y > FAR_LIMIT || y < -FAR_LIMIT)
+        if (x != x || y != y || x > FAR_LIMIT || x < -FAR_LIMIT || y > FAR_LIMIT || y < -FAR_LIMIT ||
+            cx != cx || cy != cy || cx > FAR_LIMIT || cx < -FAR_LIMIT || cy > FAR_LIMIT || cy < -FAR_LIMIT)
         {
-            if (n < 16) part[n++] = pt;
+            if (n >= 256) continue;                             /* more than that in one step: the rest at the next one */
+            part[n++] = pt;
             if (g_far_notes < 40)
             {
                 DWORD tmpl = q[1];
