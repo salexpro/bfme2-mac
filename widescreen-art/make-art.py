@@ -11,7 +11,11 @@ Writes into the output folder:
                         wins) with the main-menu logo (art\\compiledtextures\\lo\\logowithshadow.tga), the start-up
                         loading screen (lo\\load_w_ea.jpg) and the title screen (ti\\titlescreenuserinterface.jpg) squeezed horizontally by
                         (4/3)/aspect, so that they have their real proportions again once the game stretches its 4:3
-                        layout over a wide picture.
+                        layout over a wide picture. With the title screen goes its mask (ti\\titlescreenuserinterface.png):
+                        the picture has a see-through hole in the medallion at the bottom, the spinning ring is drawn
+                        underneath and shows through it, and the game takes the hole from the alpha of that .png. It
+                        is squeezed the same way, or the hole stays an oval that cuts into the round frame. (The ring
+                        itself is a small video; the d3d9 proxy draws it narrower to match, see letterbox.c.)
   root/<language>splash.jpg   only if custom/<language>splash.jpg exists: an enhanced copy, same size, of the small
                         picture shown before the game starts.
 A finished wide loading screen can be supplied as custom/load_w_ea-16x9.png (see loading-screen/); for a shape
@@ -142,6 +146,19 @@ def main():
             buf = io.BytesIO(); canvas.save(buf, format='JPEG', quality=92)
             files.append((name, buf.getvalue()))
             print('%s %dx%d from %s squeezed to %d wide with black sides' % (name.split('\\')[-1], w, h, src, nw))
+        # The title screen's see-through hole (the spinning ring shows through it) is not in the .jpg: the game takes it
+        # from the alpha of a .png with the same name. Both ways above put the middle of the 4:3 picture, squeezed by k,
+        # into the middle of the texture, so the mask is squeezed about the middle too; the freed sides are opaque.
+        name, blob, src = find_effective(game, 'art\\compiledtextures\\ti\\titlescreenuserinterface.png', language)
+        if blob and any(n.lower().endswith('titlescreenuserinterface.jpg') for n, _ in files):
+            im = Image.open(io.BytesIO(blob)).convert('RGBA')
+            w, h = im.size; nw = max(1, round(w * k))
+            alpha = Image.new('L', (w, h), 255)                  # only the alpha is resized: the colour stays as it is
+            alpha.paste(im.getchannel('A').resize((nw, h), Image.LANCZOS), ((w - nw) // 2, 0))
+            canvas = im.copy(); canvas.putalpha(alpha)
+            buf = io.BytesIO(); canvas.save(buf, format='PNG')
+            files.append((name, buf.getvalue()))
+            print('%s (the title screen\'s mask) %dx%d from %s squeezed to %d wide' % (name.split('\\')[-1], w, h, src, nw))
         files += hud_files(game, aspect)
         if files:
             # Root archives: sorted by name, the first copy of a file wins ('!' sorts first).

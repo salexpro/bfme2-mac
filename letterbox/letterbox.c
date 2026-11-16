@@ -359,6 +359,40 @@ static void iat_hook(HMODULE mod, const char *dll, const char *name, void *fn)
     logf("%s %s!%s", n ? "hooked" : "NOT hooked (not imported):", dll, name);
 }
 
+/* ---- the title screen's ring from the larger of the game's two copies (ringhd=1) ----
+ * data\movies holds the spinning ring twice: smallring.vp6 (64x64; the title screen plays this one) and
+ * loadingring.vp6 (128x128, the same 140 frames, twice as sharp). The game opens its loose files with the C
+ * runtime's _wopen: when it asks for the small one it is given the large one, if that file is there. The game's files
+ * stay as they are. (_wopen's third argument is optional; passing on what is in its place is harmless.) */
+static int cfg_ringhd = 1;
+static int (__cdecl *o_crt_wopen)(const WCHAR *, int, int);
+static int __cdecl h_crt_wopen(const WCHAR *path, int flags, int mode)
+{
+    static const WCHAR small_name[] = L"smallring.vp6", large_name[] = L"loadingring.vp6";
+    static int said;
+    WCHAR buf[MAX_PATH];
+    int n = path ? lstrlenW(path) : 0, k = sizeof(small_name) / sizeof(WCHAR) - 1;
+    if (n >= k && path[n - 1] == L'6' && n - k + (int)(sizeof(large_name) / sizeof(WCHAR)) <= MAX_PATH && !lstrcmpiW(path + n - k, small_name) &&
+        (n == k || path[n - k - 1] == L'\\' || path[n - k - 1] == L'/'))
+    {
+        memcpy(buf, path, (n - k) * sizeof(WCHAR));
+        memcpy(buf + n - k, large_name, sizeof(large_name));
+        if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES)
+        {
+            if (!said) { said = 1; logf("ring: the game opened smallring.vp6 and was given loadingring.vp6 (128x128 instead of 64x64)"); }
+            path = buf;
+        }
+    }
+    return o_crt_wopen(path, flags, mode);
+}
+static void ring_hd_install(HMODULE exe)
+{
+    HMODULE crt = GetModuleHandleA("msvcr71.dll");
+    o_crt_wopen = crt ? (void *)GetProcAddress(crt, "_wopen") : NULL;
+    if (o_crt_wopen) iat_hook(exe, "msvcr71.dll", "_wopen", h_crt_wopen);
+    else logf("ring: no _wopen in msvcr71.dll, the small ring video stays");
+}
+
 /* ---- Direct3D ---- */
 static HRESULT (WINAPI *o_CreateDevice)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
 static HRESULT (WINAPI *o_Reset)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
@@ -1639,8 +1673,101 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
 }
 static DWORD g_holds, g_hold_frames, g_hold_longest, g_ticks_seen;   /* per window: ticks the engine held back */
 static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
+/* ---- the spinning ring of the title screen ----
+ * The ring is a small video (64x64, or 128x128 with ringhd) that the game draws as a square of its 4:3 layout: two triangles with identity
+ * view and projection, like all of its 2D drawing, in the middle of the bottom of the screen (on a 1728x1084
+ * picture: x -0.065 .. 0.059, y -0.848 .. -0.681 in clip space, i.e. 107 x 90 pixels). The game stretches that
+ * layout over the wide picture, so the ring is an oval. Its quad gets its width multiplied by (4/3) / picture shape
+ * about its own middle.
+ * The title picture is drawn after it, over the whole screen, with a see-through hole in its medallion: the ring
+ * shows through the hole. The hole comes from the picture's mask file, which widescreen-art/make-art.py squeezes
+ * together with the picture; without that the hole itself is the oval.
+ * How the ring is found: only on screens with few draws (the title screen has three per frame; in a match there are
+ * hundreds and nothing is looked at), a draw of two triangles / four vertices whose texture is 64x64 or 128x128 has its four
+ * vertices read once; if the quad is small, centred and in the lower part of the screen, that texture is the ring's
+ * from then on. ringround=0 switches it off. */
+static int cfg_ringround = 1;
+static DWORD g_frame_no, g_prev_draws = 0xffffffff;       /* frames presented; draws in the frame before this one */
+static IDirect3DBaseTexture9 *g_ring_tex;                 /* the ring video's texture, once seen */
+static float g_ring_cx;                                   /* the middle of its quad (clip-space x) */
+static IDirect3DBaseTexture9 *g_ring_no[8];               /* textures already looked at that are not it */
+static BOOL is_identity(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE which)
+{
+    static const D3DMATRIX id = {{{ 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 }}};
+    D3DMATRIX m;
+    return SUCCEEDED(IDirect3DDevice9_GetTransform(dev, which, &m)) && !memcmp(&m, &id, sizeof(m));
+}
+static BOOL ring_is_it(IDirect3DDevice9 *dev, IDirect3DBaseTexture9 *tex, INT base, UINT minv)
+{
+    static UINT next;
+    IDirect3DVertexBuffer9 *vb = NULL;
+    D3DSURFACE_DESC sd;
+    UINT off = 0, stride = 0, i;
+    BYTE *p = NULL;
+    float x0 = 9, x1 = -9, y0 = 9, y1 = -9;
+    BOOL ok = FALSE;
+    for (i = 0; i < 8; i++) if (g_ring_no[i] == tex) return FALSE;
+    if (IDirect3DBaseTexture9_GetType(tex) == D3DRTYPE_TEXTURE && SUCCEEDED(IDirect3DTexture9_GetLevelDesc((IDirect3DTexture9 *)tex, 0, &sd)) &&
+        sd.Width == sd.Height && (sd.Width == 64 || sd.Width == 128) && is_identity(dev, D3DTS_VIEW) && is_identity(dev, D3DTS_PROJECTION) &&
+        SUCCEEDED(IDirect3DDevice9_GetStreamSource(dev, 0, &vb, &off, &stride)) && vb)
+    {
+        if (stride >= 12 && SUCCEEDED(IDirect3DVertexBuffer9_Lock(vb, off + (base + minv) * stride, 4 * stride, (void **)&p, D3DLOCK_READONLY)) && p)
+        {
+            for (i = 0; i < 4; i++)
+            {
+                const float *v = (const float *)(p + i * stride);
+                if (v[0] < x0) x0 = v[0];
+                if (v[0] > x1) x1 = v[0];
+                if (v[1] < y0) y0 = v[1];
+                if (v[1] > y1) y1 = v[1];
+            }
+            IDirect3DVertexBuffer9_Unlock(vb);
+            {
+                /* The ring's quad: 3 to 12.5 % of the screen wide (0.06 to 0.25 in clip units), centred, in the
+                 * lower part of the screen, and a square once its width is corrected (within 8 %). Other small
+                 * quads with such a texture down there (an icon 23 pixels wide was one) are not. */
+                float w = x1 - x0, h = y1 - y0, cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+                float wpx = w * (float)g.gw * ((4.0f / 3.0f) * (float)g.gh / (float)g.gw), hpx = h * (float)g.gh;
+                if (w > 0.06f && w < 0.25f && cx > -0.05f && cx < 0.05f && cy < -0.4f && hpx > 0.0f && wpx > hpx * 0.92f && wpx < hpx * 1.08f)
+                {
+                    g_ring_cx = cx;
+                    ok = TRUE;
+                }
+            }
+        }
+    }
+    if (vb) IDirect3DVertexBuffer9_Release(vb);
+    if (ok) { g_ring_tex = tex; logf("ring: its texture is %p (%ux%u), quad x %d..%d y %d..%d (thousandths of the half screen)", (void *)tex, sd.Width, sd.Height, (int)(x0 * 1000), (int)(x1 * 1000), (int)(y0 * 1000), (int)(y1 * 1000)); }
+    else g_ring_no[next++ & 7] = tex;
+    return ok;
+}
+static HRESULT ring_draw(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
+{
+    static int said;
+    IDirect3DBaseTexture9 *cur = NULL;
+    D3DMATRIX world, m;
+    HRESULT hr;
+    float k;
+    if (!g.gw || !g.gh || FAILED(IDirect3DDevice9_GetTexture(dev, 0, &cur)) || !cur) return o_DIP(dev, t, base, minv, nv, start, prims);
+    IDirect3DBaseTexture9_Release(cur);                       /* only compared from here on, except in ring_is_it, where the device still holds it */
+    k = (4.0f / 3.0f) * (float)g.gh / (float)g.gw;
+    if (k > 0.999f || (cur != g_ring_tex && !ring_is_it(dev, cur, base, minv))) return o_DIP(dev, t, base, minv, nv, start, prims);
+    if (!is_identity(dev, D3DTS_VIEW) || !is_identity(dev, D3DTS_PROJECTION) || FAILED(IDirect3DDevice9_GetTransform(dev, D3DTS_WORLD, &world)))
+        return o_DIP(dev, t, base, minv, nv, start, prims);
+    m = world;                                                /* x of the result: middle + (x - middle) * k */
+    m._11 *= k; m._21 *= k; m._31 *= k; m._41 = m._41 * k + g_ring_cx * (1.0f - k);
+    IDirect3DDevice9_SetTransform(dev, D3DTS_WORLD, &m);
+    hr = o_DIP(dev, t, base, minv, nv, start, prims);
+    IDirect3DDevice9_SetTransform(dev, D3DTS_WORLD, &world);
+    if (!said) { said = 1; logf("ring: drawn at %d/1000 of its width (round on this picture shape)", (int)(k * 1000)); }
+    return hr;
+}
 static HRESULT WINAPI lb_DIP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
-{ fr.draws++; g_win_draws++; return o_DIP(dev, t, base, minv, nv, start, prims); }
+{
+    fr.draws++; g_win_draws++;
+    if (cfg_ringround && prims == 2 && nv == 4 && g_prev_draws <= 40) return ring_draw(dev, t, base, minv, nv, start, prims);
+    return o_DIP(dev, t, base, minv, nv, start, prims);
+}
 static HRESULT WINAPI lb_DP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT start, UINT prims)
 { fr.draws++; g_win_draws++; return o_DP(dev, t, start, prims); }
 /* The game locks a vertex buffer well over a thousand times a frame in a battle, so these two must stay cheap: the
@@ -1947,7 +2074,7 @@ __attribute__((naked)) static void h_SetLogicInterp(void)
  *    phase lasts several frames (4 at 120 fps), so on the second frame of phase 1 the pair was refreshed again, prev
  *    became equal to cur, and the value stood still for the rest of the tick: fades climbed in 200 ms steps, birds and
  *    animals animated at 5 fps. The check is true only on the first drawn frame of phase 1 now. */
-static DWORD g_frame_no, g_p1_frame = 0xffffffff;
+static DWORD g_p1_frame = 0xffffffff;
 static BOOL g_seen_other_phase = TRUE;
 __attribute__((used)) static DWORD __cdecl first_phase_once(void *engine)
 {
@@ -2443,6 +2570,8 @@ static HRESULT WINAPI lb_CreateTex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT l
         void **vt = *(void ***)*out;
         patch_slot(&vt[19], lb_TexLock, (void **)&o_TexLock);
         patch_slot(&vt[20], lb_TexUnlock, (void **)&o_TexUnlock);
+        if ((IDirect3DBaseTexture9 *)*out == g_ring_tex) g_ring_tex = NULL;      /* that address belongs to another texture now */
+        { int q; for (q = 0; q < 8; q++) if (g_ring_no[q] == (IDirect3DBaseTexture9 *)*out) g_ring_no[q] = NULL; }
     }
     return hr;
 }
@@ -2646,6 +2775,7 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         void **eng = (void **)0xde4324;      /* frame boundary for the first-phase latch */
         frame_len_tick();
         g_frame_no++;
+        g_prev_draws = fr.draws;
         g_wd_frames++;
         if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40) && *(DWORD *)((BYTE *)*eng + 0x34) != 1) g_seen_other_phase = TRUE;
         if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x60))
@@ -2975,6 +3105,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_firstphase = (int)GetPrivateProfileIntW(L"letterbox", L"firstphase", 1, ini);
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
             cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
+            cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
+            cfg_ringhd = (int)GetPrivateProfileIntW(L"letterbox", L"ringhd", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
@@ -3005,6 +3137,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 #define RESOLVE(n) real_##n = (void *)GetProcAddress(g_real, #n);
         FWD(RESOLVE)
         iat_hook(exe, "user32.dll", "GetCursorPos", h_GetCursorPos);
+        if (cfg_ringhd) ring_hd_install(exe);
         iat_hook(exe, "user32.dll", "SetCursorPos", h_SetCursorPos);
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
         iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);

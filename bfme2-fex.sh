@@ -114,13 +114,18 @@ if [ -n "$RES" ] && [ ! -e "$T/widescreen-art/disabled" ]; then
       if [ -f "${d}!widescreen-art.big" ] && [ $((n - k)) -ge -12 ] && [ $((n - k)) -le 12 ]; then ART="${d%/}"; KEY="a$n"; break; fi
     done
   fi
-  if [ ! -f "$ART/!widescreen-art.big" ]; then
+  # A set from before the last change of make-art.py is built again, once (without uv, or if that fails, it stays in use).
+  STALE=""; [ -f "$ART/!widescreen-art.big" ] && [ "$T/widescreen-art/make-art.py" -nt "$ART/!widescreen-art.big" ] && STALE=1
+  if [ ! -f "$ART/!widescreen-art.big" ] || [ -n "$STALE" ]; then
     UV=$(command -v uv 2>/dev/null) || UV=""
     for c in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do [ -n "$UV" ] || { [ -x "$c" ] && UV="$c"; }; done
     if [ -n "$UV" ]; then
-      say "building the art set $KEY for ${rw}x${rh}"
-      "$UV" run -q --with pillow python "$T/widescreen-art/make-art.py" "$GAME" "$ART" "$rw/$rh" >> "$LOG" 2>&1
+      SHAPE="$rw/$rh"                               # a set borrowed from a nearby shape is built again for its own shape
+      [ "$KEY" = "$(shape_key "$rw" "$rh")" ] || SHAPE="${KEY#a}/1000"
+      say "building the art set $KEY for ${rw}x${rh}${STALE:+ again (make-art.py has changed)}"
+      "$UV" run -q --with pillow python "$T/widescreen-art/make-art.py" "$GAME" "$ART" "$SHAPE" >> "$LOG" 2>&1
     fi
+    [ -z "$STALE" ] || touch "$ART/!widescreen-art.big"
   fi
   if [ ! -f "$ART/!widescreen-art.big" ] && [ "$KEY" != 16x9 ]; then     # no HUD for this shape: 16:9 inside it
     rh=$(( (rw * 9 / 16) & ~1 )); RES="$rw $rh"; ART="$T/widescreen-art/out/16x9"
