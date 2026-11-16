@@ -22,7 +22,8 @@ No game files are included. You need your own installation of the game.
 | 16:9 trims the top and bottom of what 4:3 shows | The camera's field of view is widened so the 4:3 height is kept and the sides are added (`horplus`). |
 | Round command buttons over buildings are ovals at 16:9 | Drawn round. |
 | In a network game a machine that falls behind the other (a hitch, a long load) crawls at 5–15 fps for minutes and cannot catch up | Fixed in the patched SAGE Unlocked: while several ticks of the other side's data are waiting, the game's own catch-up runs (ticks back to back) instead of the unlocker's timetable; with 2–3 waiting the timetable runs at double speed. Level again within seconds. |
-| The game freezes for good in a long or big match (one thread at 100 %, no more frames) | A write of the game into a part of its own heap that is not committed is a crash on Windows; the FEX emulator turns it into an endless fault loop. `heapkeep` in `letterbox/d3d9.dll` keeps the game's reserved heap ranges accessible, so the write lands in unused memory. (What makes the game write there is a separate, open problem, see below.) |
+| The game freezes for good in a long or big match (one thread at 100 %, no more frames) | A write of the game into a part of its own heap that is not committed is a crash on Windows; the FEX emulator turns it into an endless fault loop. `heapkeep` in `letterbox/d3d9.dll` keeps the game's reserved heap ranges accessible, so the write lands in unused memory. (What makes the game write there is a separate, open problem, see "Big matches" below.) |
+| Crash in the middle of a match, in a network game on both machines at the same moment (access violation at `game.dat` 0x404A21) | A bug of this proxy up to release v1.1, not of the game: `game.dat` was compiled as one unit and keeps values in registers across its own calls, and three of the proxy's hooks were plain C functions that changed them (the tint-flash hook returned with a number in `edx` that the game then used as a pointer). Every hook inside the game's code is now an assembly routine that keeps all registers, the flags and the FPU/SSE state. |
 | Low frame rate in battles although the GPU is idle | Measured with the proxy's own profilers: Wine's Direct3D 9 runs on macOS OpenGL with a helper thread, every vertex-buffer write of the game is a synchronous round trip to that thread, and every OpenGL call is an expensive emulator crossing. `noglcheck` stops the error query after each OpenGL call (+12 %), `spinwait` keeps the helper thread polling instead of sleeping between the round trips (+12 %). |
 | In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
@@ -96,15 +97,25 @@ BFME_URL="steam://rungameid/<game id of the shortcut>"
   `RES="1920 1080"`, `FPS=60`, `INSET=0`, `VALIGN=top`.
 - An empty file `sage-unlocked/disabled` starts the game without the frame-rate unlock (stock 30 fps).
 
-## Big matches and the even interpolation
+## Big matches
 
-`sage-unlocked/files/SAGEUnlocked.ini` ships with `skip=eveninterp`: the drawn interpolation that runs evenly over a
-logic tick (steady movers no longer hitch five times a second) is switched off. With it on, an 8-player skirmish
-against Brutal AIs crashed or froze after 6-18 minutes in seven runs out of seven (a crash in a list unlink of the
-game's collision manager, `game.dat` 0xB6DD43 / 0x404A21; under FEX the same fault could also become the endless fault
-loop that `heapkeep` now prevents). With it off: five runs of 22-32 minutes, one fault. At the stock 30 fps
-(`sage-unlocked/disabled`): none. Why interpolation values below phase/6 damage the collision bookkeeping is not found
-yet; `soak.sh` reproduces it (`FRESH=1 ./soak.sh 30` with an 8-player setup).
+Still open: in a big match a unit can end up far outside the map. In the one case looked at so far it is a Goblin
+Cave Troll at x = 5.6e9, y = -6.9e9 (the map is a few thousand units wide). The game's collision manager sorts every
+object's extent along each axis; at that distance the extent has no width in single precision, the end of it sorts
+before the start, and the sweep unlinks an object it never linked: access violation at `game.dat` 0xB6DD43, writing
+address 0. Before that it may index its cell table with the huge coordinate, which under FEX was the endless fault loop
+that `heapkeep` now prevents. What moves the unit there is not found yet.
+
+Seen only in stress tests so far (8 players on The Wold, 7 Brutal AIs, 120 fps): in every run with the unlocker's even
+interpolation on, after 6-18 minutes, and in one of five runs (132 minutes) with it off; never at the stock 30 fps
+(`sage-unlocked/disabled`). So `sage-unlocked/files/SAGEUnlocked.ini` ships with `skip=eveninterp`: the drawn
+interpolation that runs evenly over a logic tick (steady movers no longer hitch five times a second) is switched off
+until the cause is known. A save made after the unit has left the map crashes a few minutes after every load,
+whatever the settings.
+
+When the game itself faults, the proxy writes a note to `letterbox.log` first ("game fault: ..."): registers, stack,
+return addresses and, at 0xB6DD43, the object concerned with its position and name. `soak.sh` reproduces the problem
+(`FRESH=1 ./soak.sh 30` with an 8-player setup).
 
 ## Test aids
 
