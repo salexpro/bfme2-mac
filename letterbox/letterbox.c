@@ -95,6 +95,84 @@ static void logf(const char *fmt, ...)
     CloseHandle(f);
 }
 
+/* ---- what a crash looked like ----
+ * When the game itself faults (an access violation with eip inside game.dat's code) the registers, the code bytes
+ * at eip, the top of the stack and the return addresses found on it are written to the log before anything else
+ * handles the exception. Nothing is changed: this only looks and passes the exception on. (watch=0 switches it off.) */
+static DWORD g_code_lo = 0x401000, g_code_hi = 0xbd0000;
+static BOOL after_call(DWORD a)            /* is the instruction before this address a call? */
+{
+    const BYTE *p = (const BYTE *)(ULONG_PTR)a;
+    if (a < g_code_lo + 8 || a >= g_code_hi) return FALSE;
+    if (p[-5] == 0xE8) return TRUE;                                         /* call rel32 */
+    if (p[-6] == 0xFF && (p[-5] == 0x15 || (p[-5] & 0xF8) == 0x90)) return TRUE;   /* call [abs] / call [reg+disp32] */
+    if (p[-3] == 0xFF && (p[-2] & 0xF8) == 0x50) return TRUE;               /* call [reg+disp8] */
+    if (p[-2] == 0xFF && ((p[-1] & 0xF8) == 0xD0 || (p[-1] & 0xF8) == 0x10)) return TRUE;   /* call reg / call [reg] */
+    return FALSE;
+}
+static LONG CALLBACK crash_note(EXCEPTION_POINTERS *x)
+{
+    static LONG said;
+    EXCEPTION_RECORD *r = x->ExceptionRecord;
+    CONTEXT *c = x->ContextRecord;
+    MEMORY_BASIC_INFORMATION mi;
+    char line[500];
+    const DWORD *sp;
+    const BYTE *ip;
+    DWORD i, n;
+    int len;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || c->Eip < g_code_lo || c->Eip >= g_code_hi) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&said) > 4) return EXCEPTION_CONTINUE_SEARCH;
+    ip = (const BYTE *)(ULONG_PTR)c->Eip;
+    logf("game fault: access violation at %08x %s address %08x, thread %u", c->Eip,
+         r->NumberParameters >= 2 && r->ExceptionInformation[0] ? "writing" : "reading",
+         r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0, GetCurrentThreadId());
+    logf("  eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x ebp %08x esp %08x | code %02x %02x %02x %02x %02x %02x %02x %02x",
+         c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
+    sp = (const DWORD *)(ULONG_PTR)c->Esp;
+    if (!VirtualQuery(sp, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return EXCEPTION_CONTINUE_SEARCH;
+    n = (DWORD)(((BYTE *)mi.BaseAddress + mi.RegionSize - (BYTE *)sp) / 4);
+    if (n > 1024) n = 1024;
+    for (len = wsprintfA(line, "  stack:"), i = 0; i < 24 && i < n; i++) len += wsprintfA(line + len, " %08x", sp[i]);
+    logf("%s", line);
+    for (len = wsprintfA(line, "  return addresses (offset from esp):"), i = 0; i < n && len < 460; i++)
+        if (after_call(sp[i])) len += wsprintfA(line + len, " %x(+%x)", sp[i], i * 4);
+    logf("%s", line);
+    {   /* what the registers point at (the object the game was working on) */
+        static const char *const name[7] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp" };
+        const DWORD reg[7] = { c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp };
+        int j;
+        for (j = 0; j < 7; j++)
+        {
+            const DWORD *p = (const DWORD *)(ULONG_PTR)(reg[j] & ~3u);
+            if (reg[j] < 0x10000 || !VirtualQuery(p, &mi, sizeof(mi)) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) continue;
+            n = (DWORD)(((BYTE *)mi.BaseAddress + mi.RegionSize - (BYTE *)p) / 4);
+            if (n > 48) n = 48;
+            for (len = wsprintfA(line, "  [%s]:", name[j]), i = 0; i < n; i++) len += wsprintfA(line + len, " %08x", p[i]);
+            logf("%s", line);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void crash_note_install(void)
+{
+    static BOOL done;
+    const BYTE *m = (const BYTE *)0x400000;
+    if (done || !cfg_watch) return;
+    done = TRUE;
+    if (!IsBadReadPtr(m, 0x400) && m[0] == 'M' && m[1] == 'Z')
+    {
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(m + ((const IMAGE_DOS_HEADER *)m)->e_lfanew);
+        const IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+        if (nt->Signature == IMAGE_NT_SIGNATURE && (s->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+        {
+            g_code_lo = 0x400000 + s->VirtualAddress;
+            g_code_hi = g_code_lo + s->Misc.VirtualSize;
+        }
+    }
+    logf("crash notes: %s (game code %08x-%08x)", AddVectoredExceptionHandler(1, crash_note) ? "on" : "NOT installed", g_code_lo, g_code_hi);
+}
+
 static void patch_slot(void **slot, void *fn, void **orig)
 {
     DWORD old;
@@ -320,10 +398,26 @@ __attribute__((used)) static DWORD __stdcall lim_target(DWORD ms)
     }
     return ms;
 }
+/* A hook that stands in for a call inside game.dat has to leave the registers exactly as the game's own function
+ * would. game.dat was compiled as one unit: a caller knows which registers its callee really uses and keeps values
+ * in the others across the call, although the calling convention would let the callee change them (at 0x675ed4 edx
+ * stays live across TintEnvelope::play, at 0x675dd1 and 0x675e86 xmm4 does). A plain C function in that place
+ * changes them. That was a real crash: the tint hook returned with a frame count in edx, the game wrote a colour
+ * through it (access violation at 0x404A21, in both games of a network match at the same tick, 16 Nov 2026).
+ * So every such hook is a small assembly routine, and the C part runs between HOOK_SAVE and HOOK_RESTORE, which
+ * keep all general registers, the flags and the whole FPU/SSE state. After HOOK_SAVE ebp points at the saved
+ * edi, esi, ebp, esp, ebx, edx, ecx, eax (+0 .. +28), the flags (+32), the return address (+36) and the stack
+ * arguments (+40 ...). */
+#define HOOK_SAVE    "pushfl\n" "pushal\n" "movl %esp, %ebp\n" "subl $512, %esp\n" "andl $-16, %esp\n" "fxsave (%esp)\n"
+#define HOOK_RESTORE "fxrstor (%esp)\n" "movl %ebp, %esp\n" "popal\n" "popfl\n"
+
 __attribute__((naked)) static void h_LimTarget(void)       /* replaces: mov esi,eax / mov ecx,edi / sub ecx,[0xde4318] */
 {
-    __asm__("pushl %eax\n"
-            "call _lim_target@4\n"
+    __asm__(HOOK_SAVE
+            "pushl 28(%ebp)\n"               /* eax: the wait in ms */
+            "call _lim_target@4\n"           /* stdcall, takes its argument off the stack */
+            "movl %eax, 28(%ebp)\n"          /* comes back as eax */
+            HOOK_RESTORE
             "movl %eax, %esi\n"
             "movl %edi, %ecx\n"
             "subl 0xde4318, %ecx\n"
@@ -1702,12 +1796,8 @@ static int cfg_logicinterp = 1;
 static int cfg_firstphase = 1;
 static int cfg_ringtiming = 1;
 static UINT cfg_gamefps = 30;
-typedef void (__attribute__((thiscall)) *win_getsize_fn)(void *win, int *w, int *h);
-typedef void (__attribute__((thiscall)) *tint_play_fn)(void *self, const float *color, UINT attack, UINT decay, UINT sustain);
-
-static void __attribute__((thiscall)) h_RadialGetSize(void *win, int *w, int *h)
+__attribute__((used)) static void __cdecl radial_fix(int *w)
 {
-    ((win_getsize_fn)0x71548d)(win, w, h);
     if (g.gw && g.gh)
     {
         int w2 = MulDiv(*w, g.gh * 4, g.gw * 3);          /* undo the 4:3 -> picture-shape stretch */
@@ -1715,9 +1805,22 @@ static void __attribute__((thiscall)) h_RadialGetSize(void *win, int *w, int *h)
         if (w2 > 0 && w2 < *w) { w[2] += (*w - w2) / 2; *w = w2; }
     }
 }
+__attribute__((used)) static const DWORD p_win_get_size = 0x71548d;
+__attribute__((naked)) static void h_RadialGetSize(void)   /* thiscall (window; int *w, int *h) */
+{
+    __asm__("pushl 8(%esp)\n"                /* h */
+            "pushl 8(%esp)\n"                /* w (the push above moved it) */
+            "call *_p_win_get_size\n"        /* the game's own function; it leaves the registers as its callers expect */
+            HOOK_SAVE
+            "pushl 40(%ebp)\n"               /* w */
+            "call _radial_fix\n"
+            "addl $4, %esp\n"
+            HOOK_RESTORE
+            "ret $8\n");
+}
 
 static double g_avg_frame_ms;      /* running average of the real frame time (set in frame_len_tick) */
-static void __attribute__((thiscall)) h_TintPlay(void *self, const float *color, UINT attack, UINT decay, UINT sustain)
+__attribute__((used)) static void __cdecl tint_scale(UINT *a)      /* a[0] attack, a[1] decay, a[2] sustain, in drawn frames */
 {
     /* How many drawn frames one 30 fps frame is right now. The envelope spends attack frames rising, then stays at
      * the peak for sustain + 3 frames (one to arrive, one to switch to "sustain", the countdown, one to release),
@@ -1725,7 +1828,20 @@ static void __attribute__((thiscall)) h_TintPlay(void *self, const float *color,
     double k = g_avg_frame_ms > 1.0 ? 33.3333 / g_avg_frame_ms : (cfg_gamefps > 30 ? cfg_gamefps / 30.0 : 1.0);
     if (k < 1.0) k = 1.0;
     if (k > 8.0) k = 8.0;
-    ((tint_play_fn)0x674818)(self, color, (UINT)(attack * k + 0.5), (UINT)(decay * k + 0.5), (UINT)((sustain + 3) * k - 3 + 0.5));
+    a[0] = (UINT)(a[0] * k + 0.5);
+    a[1] = (UINT)(a[1] * k + 0.5);
+    a[2] = (UINT)((a[2] + 3) * k - 3 + 0.5);
+}
+__attribute__((used)) static const DWORD p_tint_play = 0x674818;
+__attribute__((naked)) static void h_TintPlay(void)        /* thiscall (envelope; const float *color, attack, decay, sustain) */
+{
+    __asm__(HOOK_SAVE
+            "leal 44(%ebp), %eax\n"          /* the three lengths, changed where the caller pushed them */
+            "pushl %eax\n"
+            "call _tint_scale\n"
+            "addl $4, %esp\n"
+            HOOK_RESTORE
+            "jmp *_p_tint_play\n");          /* on into the game's function with every register as the caller left it */
 }
 
 /* 3. The logic-side interpolation fraction. During the engine update the game sets its interpolation value to
@@ -1798,10 +1914,19 @@ static LARGE_INTEGER g_fl_last;
 static double g_fl_last_vt;
 static BOOL g_fl_hooked;
 
-static void WINAPI h_SetFrameLen(float ms)
+__attribute__((used)) static void __cdecl frame_len_set(float ms)
 {
     if (ms > 1.0f && ms < 200.0f) g_fl_base = ms;        /* what the game asked for (33.3 normally) */
     *(DWORD *)0xdc7a8c = g_fl_ms;
+}
+__attribute__((naked)) static void h_SetFrameLen(void)     /* stdcall (float ms); the game's own setter only changes eax */
+{
+    __asm__(HOOK_SAVE
+            "pushl 40(%ebp)\n"
+            "call _frame_len_set\n"
+            "addl $4, %esp\n"
+            HOOK_RESTORE
+            "ret $4\n");
 }
 
 static void frame_len_hook(void)          /* (re)install; SAGE Unlocked may patch the same place before or after us */
@@ -1908,16 +2033,27 @@ static int cfg_netfps = 1;
 __attribute__((used)) static float k_one = 1.0f;
 static int cfg_steamoverlay = 0;   /* steamoverlay=1: load NotProton's Steam bridge into the game so the Steam overlay (FPS counter) can attach */
 double tan(double); double atan(double);     /* from the C runtime; <math.h> is not included because it declares logf() */
-typedef void (__attribute__((thiscall)) *set_view_plane_fn)(void *cam, float hfov, float vfov);
-static void __attribute__((thiscall)) h_SetViewPlane(void *cam, float hfov, float vfov)
+__attribute__((used)) static void __cdecl view_plane_widen(void *cam, float *arg)     /* arg[0] = hfov, arg[1] = vfov */
 {
-    if (vfov == -1.0f)
+    if (arg[1] == -1.0f)
     {
         float a = *(float *)((BYTE *)cam + 0xe8);        /* the camera's width / height */
+        float hfov = arg[0];
         if (a > 1.34f && a < 4.0f && hfov > 0.01f && hfov < 2.6f)
-            hfov = 2.0f * (float)atan(tan(hfov * 0.5) * (a * 0.75));
+            arg[0] = 2.0f * (float)atan(tan(hfov * 0.5) * (a * 0.75));
     }
-    ((set_view_plane_fn)0x533590)(cam, hfov, vfov);
+}
+__attribute__((used)) static const DWORD p_set_view_plane = 0x533590;
+__attribute__((naked)) static void h_SetViewPlane(void)    /* thiscall (camera; float hfov, float vfov) */
+{
+    __asm__(HOOK_SAVE
+            "leal 40(%ebp), %eax\n"          /* hfov and vfov where the caller pushed them */
+            "pushl %eax\n"
+            "pushl 24(%ebp)\n"               /* the camera (ecx) */
+            "call _view_plane_widen\n"
+            "addl $8, %esp\n"
+            HOOK_RESTORE
+            "jmp *_p_set_view_plane\n");
 }
 
 static void patch_game_code(void)
@@ -2428,6 +2564,7 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
         noglcheck_install();
         cswait_install();
         heapkeep_scan();
+        crash_note_install();
         patch_slot(&vt[14], lb_GetSwapChain, (void **)&o_GetSwapChain);
         patch_slot(&vt[16], lb_Reset, (void **)&o_Reset);
         patch_slot(&vt[17], lb_Present, (void **)&o_Present);
