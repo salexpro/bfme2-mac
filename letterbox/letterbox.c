@@ -1639,12 +1639,15 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
 }
 static DWORD g_holds, g_hold_frames, g_hold_longest, g_ticks_seen;   /* per window: ticks the engine held back */
 static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
-/* ---- the spinning ring of the title and loading screens ----
+/* ---- the spinning ring of the title screen ----
  * The ring is a small video (64x64) that the game draws as a square of its 4:3 layout: two triangles with identity
  * view and projection, like all of its 2D drawing, in the middle of the bottom of the screen (on a 1728x1084
  * picture: x -0.065 .. 0.059, y -0.848 .. -0.681 in clip space, i.e. 107 x 90 pixels). The game stretches that
- * layout over the wide picture, so the ring is an oval inside its round medallion. Its quad gets its width
- * multiplied by (4/3) / picture shape about its own middle.
+ * layout over the wide picture, so the ring is an oval. Its quad gets its width multiplied by (4/3) / picture shape
+ * about its own middle.
+ * The title picture is drawn after it, over the whole screen, with a see-through hole in its medallion: the ring
+ * shows through the hole. The hole comes from the picture's mask file, which widescreen-art/make-art.py squeezes
+ * together with the picture; without that the hole itself is the oval.
  * How the ring is found: only on screens with few draws (the title screen has three per frame; in a match there are
  * hundreds and nothing is looked at), a draw of two triangles / four vertices whose texture is 64x64 has its four
  * vertices read once; if the quad is small, centred and in the lower part of the screen, that texture is the ring's
