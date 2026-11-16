@@ -10,7 +10,7 @@ display-override.conf
 local.conf
 .last-launch
 sage-unlocked/disabled
-# intermediate copies of the patched SAGE Unlocked source (the current one is source-fexfix4)
+# intermediate copies of the patched SAGE Unlocked source (the current one is source-fexfix5)
 sage-unlocked/source-fexfix/
 sage-unlocked/source-fexfix2/
 sage-unlocked/source-fexfix3/
@@ -24,5 +24,5 @@ bfme2.sh
 dgvoodoo-override.reg
 fex-game.reg
 .DS_Store
-sage-unlocked/source-fexfix4/*.diff
+sage-unlocked/source-fexfix5/*.diff
 __pycache__/

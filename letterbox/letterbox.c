@@ -1367,12 +1367,11 @@ static void draw_fps(IDirect3DDevice9 *dev, IDirect3DSurface9 *bb)
 
 /* ---- SetThreadPriority, answered locally when nothing changes ----
  * The game's asset streamer (0xa37e50) sets its loader thread's priority at the end of every pump:
- * SetThreadPriority(thread, queue longer than a threshold ? NORMAL : BELOW_NORMAL). In a network game, a machine that
- * has fallen behind the other one (after a hitch) pumps the streamer thousands of times per logic tick while it catches
- * up, always with the same value. On Windows that call is nearly free. Under Wine every call is a round trip to the
- * wineserver: measured 100,000 calls in 6 s, most of every tick, so the machine stood still ~170 ms per tick, could
- * not run ticks faster than the other machine and never caught up (5 fps on the faster Mac, 14 on the slower, for
- * minutes). A repeat of the last value for the same handle within a second is answered here without the call. */
+ * SetThreadPriority(thread, queue longer than a threshold ? NORMAL : BELOW_NORMAL), and the engine pumps it once per
+ * update. On Windows that call is nearly free; under Wine every one is a round trip to the wineserver. A repeat of
+ * the last value for the same handle within a second is answered here without the call.
+ * (This is how the network catch-up crawl was found: a machine that was behind ran ~200,000 empty updates a second,
+ * 100,000 of these calls in 6 s. The crawl itself is fixed in the patched SAGE Unlocked, 1.9.6+fexfix5.) */
 static DWORD g_prio_skipped;
 static BOOL WINAPI h_SetThreadPriority(HANDLE h, int prio)
 {
@@ -1386,32 +1385,7 @@ static BOOL WINAPI h_SetThreadPriority(HANDLE h, int prio)
     {
         if (last[i].h == h)
         {
-            if (last[i].prio == prio && now - last[i].tick < 1000)
-            {
-                /* diagnostic: when these repeats come in a flood, write down who is asking (return addresses on the stack) */
-                static DWORD win_tick, win_n, said;
-                g_prio_skipped++;
-                if (now - win_tick > 1000) { win_tick = now; win_n = 0; }
-                if (++win_n == 20000 && said < 3)
-                {
-                    char line[420]; int n = 0, k; DWORD *sp = (DWORD *)&h;
-                    said++; line[0] = 0;
-                    for (k = 0; k < 400 && n < 380; k++)
-                    {
-                        DWORD v;
-                        if (IsBadReadPtr(sp + k, 4)) break;
-                        v = sp[k];
-                        if (v > 0x401005 && v < 0xbc0000 && !IsBadReadPtr((void *)(ULONG_PTR)(v - 6), 6))
-                        {
-                            const BYTE *c = (const BYTE *)(ULONG_PTR)v;
-                            if (c[-5] == 0xE8 || (c[-2] == 0xFF && (c[-1] & 0x38) == 0x10) || (c[-3] == 0xFF && (c[-2] & 0x38) == 0x10) || (c[-6] == 0xFF && (c[-5] & 0x38) == 0x10))
-                                n += wsprintfA(line + n, " %08x", v);
-                        }
-                    }
-                    logf("  SetThreadPriority flood: callers on the stack:%s", line);
-                }
-                InterlockedExchange(&busy, 0); return TRUE;
-            }
+            if (last[i].prio == prio && now - last[i].tick < 1000) { g_prio_skipped++; InterlockedExchange(&busy, 0); return TRUE; }
             slot = i; break;
         }
         if (now - last[i].tick > now - last[slot].tick) slot = i;                /* otherwise reuse the oldest entry */
@@ -1428,6 +1402,7 @@ static BOOL WINAPI h_SetThreadPriority(HANDLE h, int prio)
  * data in a network game, a timer). The game's own Sleep, WaitForSingleObject and select calls on the game thread are
  * timed per calling address; a frame that waited more than 100 ms before drawing gets a line saying where. */
 static DWORD g_main_tid;
+static int g_net_min, g_net_max; static DWORD g_net_n; static double g_net_sum;   /* network cushion samples of this window */
 static struct { DWORD ra; char kind; DWORD us, calls; } g_waits[8];
 static int (WINAPI *o_select)(int, void *, void *, void *, const void *);
 static void wait_note(char kind, DWORD ra, DWORD us)
@@ -1524,6 +1499,18 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         }
     }
     waits_report(fr.first_scene_us);
+    {
+        /* network cushion: how many ticks of the other players' data are waiting (TheNetwork [0xde4468], vtbl+0x58; the
+         * engine's own catch-up check at 0x63239d reads the same). More than 1 for long = this machine runs behind. */
+        void **net = *(void ***)0xde4468;
+        if (net && !IsBadReadPtr(net, 4) && !IsBadReadPtr(*net, 0x5c))
+        {
+            int n = ((int (__attribute__((thiscall)) *)(void *))((void **)*net)[0x58 / 4])(net);
+            if (n < g_net_min || !g_net_n) g_net_min = n;
+            if (n > g_net_max || !g_net_n) g_net_max = n;
+            g_net_sum += n; g_net_n++;
+        }
+    }
     ZeroMemory(g_waits, sizeof(g_waits));
     g_main_tid = GetCurrentThreadId();
     rec_texcreates = fr.tex_creates;
@@ -1561,6 +1548,7 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
             g_sync_waits = g_sync_wait_us = g_sync_late_work = g_sync_late_wait = g_sync_work_max = g_sync_sleeps = g_vt_skips = g_vt_resyncs = g_vt_lim_pushed = 0;
         }
         if (g_fast_filters || g_slow_filters) { logf("  mip filters this window: %u fast, %u through d3dx", g_fast_filters, g_slow_filters); g_fast_filters = g_slow_filters = 0; }
+        if (g_net_n) { logf("  network: ticks of the other side's data waiting: min %d, average %d.%d, max %d", g_net_min, (int)(g_net_sum / g_net_n), (int)(g_net_sum * 10 / g_net_n) % 10, g_net_max); g_net_n = 0; g_net_sum = 0; }
         { static DWORD prio_said; if (g_prio_skipped != prio_said) { logf("  repeated SetThreadPriority calls answered locally: %u in this window", g_prio_skipped - prio_said); prio_said = g_prio_skipped; } }
         ZeroMemory(&st, sizeof(st));
         t0 = now; frames = 0; max_us = 0;
