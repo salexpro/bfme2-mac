@@ -1639,8 +1639,62 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
 }
 static DWORD g_holds, g_hold_frames, g_hold_longest, g_ticks_seen;   /* per window: ticks the engine held back */
 static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
+/* ---- the spinning ring of the loading screens ----
+ * data\movies\loadingring.vp6 (128x128) is drawn as a square of the game's 4:3 layout, which the game stretches over
+ * the wide picture: an oval ring. (The medallion around it is part of the loading screens' frame texture, which
+ * widescreen-art/make-art.py rebuilds with a round one.) The texture the video is decoded into is recognised when it
+ * is created right after the game opened that file. The quad drawn with it - two triangles with identity view and
+ * projection, like all of the game's 2D drawing - gets its width multiplied by (4/3) / picture shape about the middle
+ * of the screen, which is where the medallion is. ringround=0 switches it off. */
+static int cfg_ringround = 1;
+static DWORD g_ring_opened;                      /* tick count (never 0) when the game opened the ring video */
+static IDirect3DTexture9 *g_ring_tex;            /* the texture its frames go into */
+static DWORD g_ring_locked;                      /* number of the frame in which that texture was last written */
+static DWORD g_frame_no;
+static HANDLE WINAPI h_CreateFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if (name)
+    {
+        int n = lstrlenA(name);
+        if (n >= 15 && !lstrcmpiA(name + n - 15, "loadingring.vp6")) g_ring_opened = GetTickCount() | 1;
+    }
+    return CreateFileA(name, access, share, sa, disp, flags, tmpl);
+}
+static BOOL is_identity(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE which)
+{
+    static const D3DMATRIX id = {{{ 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1 }}};
+    D3DMATRIX m;
+    return SUCCEEDED(IDirect3DDevice9_GetTransform(dev, which, &m)) && !memcmp(&m, &id, sizeof(m));
+}
+static HRESULT ring_draw(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
+{
+    static int said;
+    IDirect3DBaseTexture9 *cur = NULL;
+    D3DMATRIX world, m;
+    HRESULT hr;
+    float k;
+    if (!g.gw || !g.gh || FAILED(IDirect3DDevice9_GetTexture(dev, 0, &cur))) return o_DIP(dev, t, base, minv, nv, start, prims);
+    if (cur) IDirect3DBaseTexture9_Release(cur);
+    k = (4.0f / 3.0f) * (float)g.gh / (float)g.gw;
+    if (cur != (IDirect3DBaseTexture9 *)g_ring_tex || k > 0.999f) return o_DIP(dev, t, base, minv, nv, start, prims);
+    if (!is_identity(dev, D3DTS_VIEW) || !is_identity(dev, D3DTS_PROJECTION) || FAILED(IDirect3DDevice9_GetTransform(dev, D3DTS_WORLD, &world)))
+    {
+        if (!(said & 2)) { said |= 2; logf("ring video: its quad is not drawn the way 2D drawing is (view or projection set), left as it is"); }
+        return o_DIP(dev, t, base, minv, nv, start, prims);
+    }
+    m = world; m._11 *= k; m._21 *= k; m._31 *= k; m._41 *= k;      /* x of the result times k */
+    IDirect3DDevice9_SetTransform(dev, D3DTS_WORLD, &m);
+    hr = o_DIP(dev, t, base, minv, nv, start, prims);
+    IDirect3DDevice9_SetTransform(dev, D3DTS_WORLD, &world);
+    if (!(said & 1)) { said |= 1; logf("ring video: drawn at %d/1000 of its width (round on this picture shape)", (int)(k * 1000)); }
+    return hr;
+}
 static HRESULT WINAPI lb_DIP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
-{ fr.draws++; g_win_draws++; return o_DIP(dev, t, base, minv, nv, start, prims); }
+{
+    fr.draws++; g_win_draws++;
+    if (g_ring_tex && prims == 2 && nv == 4 && g_frame_no - g_ring_locked < 4) return ring_draw(dev, t, base, minv, nv, start, prims);
+    return o_DIP(dev, t, base, minv, nv, start, prims);
+}
 static HRESULT WINAPI lb_DP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT start, UINT prims)
 { fr.draws++; g_win_draws++; return o_DP(dev, t, start, prims); }
 /* The game locks a vertex buffer well over a thousand times a frame in a battle, so these two must stay cheap: the
@@ -1947,7 +2001,7 @@ __attribute__((naked)) static void h_SetLogicInterp(void)
  *    phase lasts several frames (4 at 120 fps), so on the second frame of phase 1 the pair was refreshed again, prev
  *    became equal to cur, and the value stood still for the rest of the tick: fades climbed in 200 ms steps, birds and
  *    animals animated at 5 fps. The check is true only on the first drawn frame of phase 1 now. */
-static DWORD g_frame_no, g_p1_frame = 0xffffffff;
+static DWORD g_p1_frame = 0xffffffff;
 static BOOL g_seen_other_phase = TRUE;
 __attribute__((used)) static DWORD __cdecl first_phase_once(void *engine)
 {
@@ -2401,6 +2455,7 @@ static HRESULT WINAPI lb_TexLock(IDirect3DTexture9 *t, UINT level, D3DLOCKED_REC
     LARGE_INTEGER a;
     HRESULT hr;
     QueryPerformanceCounter(&a);
+    if (t == g_ring_tex) g_ring_locked = g_frame_no;
     prof_begin(PROF_TEXLOCK);
     hr = o_TexLock(t, level, lr, rc, flags);
     prof_end();
@@ -2443,6 +2498,12 @@ static HRESULT WINAPI lb_CreateTex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT l
         void **vt = *(void ***)*out;
         patch_slot(&vt[19], lb_TexLock, (void **)&o_TexLock);
         patch_slot(&vt[20], lb_TexUnlock, (void **)&o_TexUnlock);
+        if (cfg_ringround && w == 128 && h == 128 && g_ring_opened && GetTickCount() - g_ring_opened < 5000)
+        {
+            g_ring_tex = *out; g_ring_opened = 0; g_ring_locked = g_frame_no;
+            logf("ring video: its frames go into texture %p (128x128, format %d, %u level(s))", (void *)*out, (int)f, lv);
+        }
+        else if (*out == g_ring_tex) g_ring_tex = NULL;      /* that address belongs to another texture now */
     }
     return hr;
 }
@@ -2975,6 +3036,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_firstphase = (int)GetPrivateProfileIntW(L"letterbox", L"firstphase", 1, ini);
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
             cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
+            cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
@@ -3009,6 +3071,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
         iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);
         if (cfg_heapkeep) { iat_hook(exe, "kernel32.dll", "VirtualAlloc", h_VirtualAlloc); iat_hook(exe, "kernel32.dll", "VirtualFree", h_VirtualFree); }
+        if (cfg_ringround) iat_hook(exe, "kernel32.dll", "CreateFileA", h_CreateFileA);
         iat_hook(exe, "kernel32.dll", "Sleep", h_Sleep);                               /* wait recorder, see waits_report */
         iat_hook(exe, "kernel32.dll", "WaitForSingleObject", h_WaitForSingleObject);
         {

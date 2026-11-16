@@ -11,7 +11,11 @@ Writes into the output folder:
                         wins) with the main-menu logo (art\\compiledtextures\\lo\\logowithshadow.tga), the start-up
                         loading screen (lo\\load_w_ea.jpg) and the title screen (ti\\titlescreenuserinterface.jpg) squeezed horizontally by
                         (4/3)/aspect, so that they have their real proportions again once the game stretches its 4:3
-                        layout over a wide picture.
+                        layout over a wide picture. Also the frame of the loading screens (lo\\loadpage_bg.dds: the
+                        ornament bands and the round medallion the spinning ring is shown in, also seen at the bottom
+                        of the title screen): the bands and the medallion are squeezed the same way and the freed
+                        sides are continued with the band's own repeating pattern. (The ring itself is a small video;
+                        the d3d9 proxy draws it narrower to match, see letterbox.c.)
   root/<language>splash.jpg   only if custom/<language>splash.jpg exists: an enhanced copy, same size, of the small
                         picture shown before the game starts.
 A finished wide loading screen can be supplied as custom/load_w_ea-16x9.png (see loading-screen/); for a shape
@@ -87,6 +91,64 @@ def hud_files(game, aspect):
                         except Exception as e: print('HUD: %s not understood (%s)' % (gname, e))
     return res
 
+def dxt5(im):
+    """one mip level as DXT5 blocks: end points = the block's extremes, each pixel the nearest step between them"""
+    w, h = im.size; W = max(4, (w + 3) // 4 * 4); H = max(4, (h + 3) // 4 * 4)
+    if (W, H) != (w, h): im = im.resize((W, H), Image.NEAREST)
+    raw = im.tobytes(); out = bytearray()
+    for by in range(0, H, 4):
+        rows = [raw[(by + j) * W * 4:(by + j + 1) * W * 4] for j in range(4)]
+        for bx in range(0, W * 4, 16):
+            px = rows[0][bx:bx + 16] + rows[1][bx:bx + 16] + rows[2][bx:bx + 16] + rows[3][bx:bx + 16]
+            a = px[3::4]; a0 = max(a); a1 = min(a); abits = 0
+            if a0 != a1:
+                d = a0 - a1
+                for i in range(16):
+                    lv = (7 * (a0 - a[i]) + d // 2) // d                     # 0 = a0 ... 7 = a1
+                    abits |= (0 if lv == 0 else 1 if lv == 7 else lv + 1) << (3 * i)
+            r = px[0::4]; g = px[1::4]; b = px[2::4]
+            r0, r1, g0, g1, b0, b1 = max(r), min(r), max(g), min(g), max(b), min(b)
+            c0 = (r0 >> 3) << 11 | (g0 >> 2) << 5 | (b0 >> 3); c1 = (r1 >> 3) << 11 | (g1 >> 2) << 5 | (b1 >> 3)
+            dr, dg, db = r0 - r1, g0 - g1, b0 - b1; dd = dr * dr + dg * dg + db * db; cbits = 0
+            if dd and c0 != c1:
+                for i in range(16):
+                    s = ((r[i] - r1) * dr + (g[i] - g1) * dg + (b[i] - b1) * db) * 6 // dd      # 0 = c1 ... 6 = c0
+                    cbits |= (1 if s < 1 else 3 if s < 3 else 2 if s < 5 else 0) << (2 * i)
+            out += bytes((a0, a1)) + abits.to_bytes(6, 'little') + struct.pack('<HHI', c0, c1, cbits)
+    return bytes(out)
+
+def frame_overlay(blob, k, period=45):
+    """The loading screens' frame (1024x1024 DXT5, the picture is its top three quarters) for a wide picture.
+    The top band with its emblem (rows 0-98) and the bottom band with the medallion (rows 644-768) are squeezed by k
+    about the middle; the freed sides are filled by repeating the band's pattern (one tile is `period` pixels wide).
+    The large window frame in between stays as it is: the game draws a picture into it."""
+    if blob[:4] != b'DDS ' or blob[84:88] != b'DXT5': raise ValueError('not a DXT5 texture')
+    h, w = struct.unpack_from('<II', blob, 12); mips = max(1, struct.unpack_from('<I', blob, 28)[0])
+    if (w, h) != (1024, 1024): raise ValueError('unexpected size %dx%d' % (w, h))
+    im = Image.open(io.BytesIO(blob)).convert('RGBA'); out = im.copy()
+    def band(y0, y1, mask_rows):          # mask_rows: (row, weight 0..255 of the new strip) pairs, linear in between
+        sh = y1 - y0; strip = im.crop((0, y0, w, y1))
+        we = int(round(w / k / 2)) * 2; m = (we - w) // 2
+        wide = Image.new('RGBA', (we, sh)); wide.paste(strip, (m, 0))
+        lt = strip.crop((0, 0, period, sh)); rt = strip.crop((w - period, 0, w, sh))
+        for j in range(1, m // period + 2):
+            wide.paste(lt, (m - j * period, 0)); wide.paste(rt, (m + w + (j - 1) * period, 0))
+        new = wide.resize((w, sh), Image.LANCZOS)
+        col = []
+        for y in range(y0, y1):
+            for (ya, wa), (yb, wb) in zip(mask_rows, mask_rows[1:]):
+                if ya <= y <= yb: col.append(int(round(wa + (wb - wa) * (y - ya) / max(1, yb - ya)))); break
+            else: col.append(mask_rows[-1][1] if y > mask_rows[-1][0] else mask_rows[0][1])
+        mask = Image.new('L', (1, sh)); mask.putdata(col)
+        out.paste(new, (0, y0), mask.resize((w, sh)))
+    band(0, 110, [(0, 255), (98, 255), (110, 0)])
+    band(632, 768, [(632, 0), (644, 255), (768, 255)])
+    data = b''; level = out
+    for i in range(mips):
+        if i: level = out.resize((max(1, w >> i), max(1, h >> i)), Image.LANCZOS)
+        data += dxt5(level)
+    return blob[:128] + data
+
 def write_big(path, files):
     table = b''; data = b''; first = 16 + sum(8 + len(n.encode('latin1')) + 1 for n, _ in files)
     for name, blob in files:
@@ -142,6 +204,13 @@ def main():
             buf = io.BytesIO(); canvas.save(buf, format='JPEG', quality=92)
             files.append((name, buf.getvalue()))
             print('%s %dx%d from %s squeezed to %d wide with black sides' % (name.split('\\')[-1], w, h, src, nw))
+        name, blob, src = find_effective(game, 'art\\compiledtextures\\lo\\loadpage_bg.dds', language)
+        if blob:
+            try:
+                new = frame_overlay(blob, k)
+                if len(new) != len(blob): raise ValueError('size %d instead of %d' % (len(new), len(blob)))
+                files.append((name, new)); print('loading-screen frame from %s: bands and medallion squeezed to %.3f' % (src, k))
+            except Exception as e: print('loading-screen frame not understood (%s), left as it is' % e)
         files += hud_files(game, aspect)
         if files:
             # Root archives: sorted by name, the first copy of a file wins ('!' sorts first).
