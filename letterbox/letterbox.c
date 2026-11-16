@@ -359,6 +359,40 @@ static void iat_hook(HMODULE mod, const char *dll, const char *name, void *fn)
     logf("%s %s!%s", n ? "hooked" : "NOT hooked (not imported):", dll, name);
 }
 
+/* ---- the title screen's ring from the larger of the game's two copies (ringhd=1) ----
+ * data\movies holds the spinning ring twice: smallring.vp6 (64x64; the title screen plays this one) and
+ * loadingring.vp6 (128x128, the same 140 frames, twice as sharp). The game opens its loose files with the C
+ * runtime's _wopen: when it asks for the small one it is given the large one, if that file is there. The game's files
+ * stay as they are. (_wopen's third argument is optional; passing on what is in its place is harmless.) */
+static int cfg_ringhd = 1;
+static int (__cdecl *o_crt_wopen)(const WCHAR *, int, int);
+static int __cdecl h_crt_wopen(const WCHAR *path, int flags, int mode)
+{
+    static const WCHAR small_name[] = L"smallring.vp6", large_name[] = L"loadingring.vp6";
+    static int said;
+    WCHAR buf[MAX_PATH];
+    int n = path ? lstrlenW(path) : 0, k = sizeof(small_name) / sizeof(WCHAR) - 1;
+    if (n >= k && path[n - 1] == L'6' && n - k + (int)(sizeof(large_name) / sizeof(WCHAR)) <= MAX_PATH && !lstrcmpiW(path + n - k, small_name) &&
+        (n == k || path[n - k - 1] == L'\\' || path[n - k - 1] == L'/'))
+    {
+        memcpy(buf, path, (n - k) * sizeof(WCHAR));
+        memcpy(buf + n - k, large_name, sizeof(large_name));
+        if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES)
+        {
+            if (!said) { said = 1; logf("ring: the game opened smallring.vp6 and was given loadingring.vp6 (128x128 instead of 64x64)"); }
+            path = buf;
+        }
+    }
+    return o_crt_wopen(path, flags, mode);
+}
+static void ring_hd_install(HMODULE exe)
+{
+    HMODULE crt = GetModuleHandleA("msvcr71.dll");
+    o_crt_wopen = crt ? (void *)GetProcAddress(crt, "_wopen") : NULL;
+    if (o_crt_wopen) iat_hook(exe, "msvcr71.dll", "_wopen", h_crt_wopen);
+    else logf("ring: no _wopen in msvcr71.dll, the small ring video stays");
+}
+
 /* ---- Direct3D ---- */
 static HRESULT (WINAPI *o_CreateDevice)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
 static HRESULT (WINAPI *o_Reset)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
@@ -1640,7 +1674,7 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
 static DWORD g_holds, g_hold_frames, g_hold_longest, g_ticks_seen;   /* per window: ticks the engine held back */
 static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
 /* ---- the spinning ring of the title screen ----
- * The ring is a small video (64x64) that the game draws as a square of its 4:3 layout: two triangles with identity
+ * The ring is a small video (64x64, or 128x128 with ringhd) that the game draws as a square of its 4:3 layout: two triangles with identity
  * view and projection, like all of its 2D drawing, in the middle of the bottom of the screen (on a 1728x1084
  * picture: x -0.065 .. 0.059, y -0.848 .. -0.681 in clip space, i.e. 107 x 90 pixels). The game stretches that
  * layout over the wide picture, so the ring is an oval. Its quad gets its width multiplied by (4/3) / picture shape
@@ -1649,7 +1683,7 @@ static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window,
  * shows through the hole. The hole comes from the picture's mask file, which widescreen-art/make-art.py squeezes
  * together with the picture; without that the hole itself is the oval.
  * How the ring is found: only on screens with few draws (the title screen has three per frame; in a match there are
- * hundreds and nothing is looked at), a draw of two triangles / four vertices whose texture is 64x64 has its four
+ * hundreds and nothing is looked at), a draw of two triangles / four vertices whose texture is 64x64 or 128x128 has its four
  * vertices read once; if the quad is small, centred and in the lower part of the screen, that texture is the ring's
  * from then on. ringround=0 switches it off. */
 static int cfg_ringround = 1;
@@ -1674,7 +1708,7 @@ static BOOL ring_is_it(IDirect3DDevice9 *dev, IDirect3DBaseTexture9 *tex, INT ba
     BOOL ok = FALSE;
     for (i = 0; i < 8; i++) if (g_ring_no[i] == tex) return FALSE;
     if (IDirect3DBaseTexture9_GetType(tex) == D3DRTYPE_TEXTURE && SUCCEEDED(IDirect3DTexture9_GetLevelDesc((IDirect3DTexture9 *)tex, 0, &sd)) &&
-        sd.Width == 64 && sd.Height == 64 && is_identity(dev, D3DTS_VIEW) && is_identity(dev, D3DTS_PROJECTION) &&
+        sd.Width == sd.Height && (sd.Width == 64 || sd.Width == 128) && is_identity(dev, D3DTS_VIEW) && is_identity(dev, D3DTS_PROJECTION) &&
         SUCCEEDED(IDirect3DDevice9_GetStreamSource(dev, 0, &vb, &off, &stride)) && vb)
     {
         if (stride >= 12 && SUCCEEDED(IDirect3DVertexBuffer9_Lock(vb, off + (base + minv) * stride, 4 * stride, (void **)&p, D3DLOCK_READONLY)) && p)
@@ -1703,7 +1737,7 @@ static BOOL ring_is_it(IDirect3DDevice9 *dev, IDirect3DBaseTexture9 *tex, INT ba
         }
     }
     if (vb) IDirect3DVertexBuffer9_Release(vb);
-    if (ok) { g_ring_tex = tex; logf("ring: its texture is %p, quad x %d..%d y %d..%d (thousandths of the half screen)", (void *)tex, (int)(x0 * 1000), (int)(x1 * 1000), (int)(y0 * 1000), (int)(y1 * 1000)); }
+    if (ok) { g_ring_tex = tex; logf("ring: its texture is %p (%ux%u), quad x %d..%d y %d..%d (thousandths of the half screen)", (void *)tex, sd.Width, sd.Height, (int)(x0 * 1000), (int)(x1 * 1000), (int)(y0 * 1000), (int)(y1 * 1000)); }
     else g_ring_no[next++ & 7] = tex;
     return ok;
 }
@@ -3072,6 +3106,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
             cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
             cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
+            cfg_ringhd = (int)GetPrivateProfileIntW(L"letterbox", L"ringhd", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
@@ -3102,6 +3137,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
 #define RESOLVE(n) real_##n = (void *)GetProcAddress(g_real, #n);
         FWD(RESOLVE)
         iat_hook(exe, "user32.dll", "GetCursorPos", h_GetCursorPos);
+        if (cfg_ringhd) ring_hd_install(exe);
         iat_hook(exe, "user32.dll", "SetCursorPos", h_SetCursorPos);
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
         iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);
