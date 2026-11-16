@@ -26,3 +26,4 @@ fex-game.reg
 .DS_Store
 sage-unlocked/source-fexfix5/*.diff
 __pycache__/
+bench-saves/

@@ -3,7 +3,7 @@ SAGE Unlocked v1.9.6 (github.com/TheeHorse/SAGE-Unlocked, GPL-3), built here fro
   CnCFpsUnlocker.dll  wine-mono csc /platform:x86 /optimize /r:System.Core.dll /target:library Unlocker.cs
 bfme2-fex.sh copies files/ into C:\BFME2 at every launch.
 
-files/CnCFpsUnlocker.dll is the source-fexfix5 build (1.9.6+fexfix5). Changes against upstream 1.9.6:
+files/CnCFpsUnlocker.dll is the source-fexfix7 build (1.9.6+fexfix5). Changes against upstream 1.9.6:
   fexfix1: scroll/spellstore scratch data on a separate read-write page (BFME II path).
   fexfix2: the scheduler's per-frame variables (clock, tick start, phase tables) on a separate read-write page, stubs stay on
            the code page (BFME II path). REQUIRED under the FEX emulator: with data and code on one page the stub's "ms*3"

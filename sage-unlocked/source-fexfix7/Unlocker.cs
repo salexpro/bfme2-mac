@@ -16,7 +16,7 @@ using System.Threading;
 
 static class Program
 {
-    public const string Version = "1.9.6+fexfix5";   // keep in step with installer/setup.iss
+    public const string Version = "1.9.6+fexfix7";   // keep in step with installer/setup.iss
     const uint ImageBase = 0x400000;
 
     // called from inside the game (dll/proxy.c)
@@ -1390,7 +1390,7 @@ static class Program
         // frame/tick ... 1.0 from that frame on. It used to be measured from tickStart, which is a sixth of a tick before
         // phase 1: it began at 1/6, hit 1.0 a sixth early and froze there (3-4 frames at 120 fps), then jumped: steady
         // movers such as birds showed missing frames five times a second.
-        bool even = code != mem && !batches && frameClock == 0;
+        bool even = code != mem && !batches && frameClock == 0 && On("eveninterp");   // [fexfix7] skip=eveninterp: the drawn interpolation as before fexfix4
         uint nready = mem + 0xDC;   // [fexfix5] ticks of the other players' data waiting, read at the top of stub A
         uint tickBegin = mem + 0xD8, bnd = mem + 0xE0;   // time of the tick's first frame; k*T/6 for k = 0..6
         // phase k is due once
@@ -1456,6 +1456,7 @@ static class Program
         // behind the real start, so all six phases ran in the first frames of a tick and the drawn interpolation hit 1.0
         // early: everything moved for ~70 ms and then stood still for the rest of the 200 ms tick. When a held-back tick
         // finally starts, restart the schedule from the frame that started it (last frame's time = phase 1).
+        if (!On("netrestart")) a.J(0xEB, "nopend");                   // [fexfix7] skip=netrestart: the timetable is not restarted (as before fexfix3)
         a.E(0x83, 0x3D); a.D(held); a.E(0x00); a.J(0x74, "nopend");
         a.E(0xC7, 0x05); a.D(held); a.D(0);
         a.E(0x8B, 0x15); a.D(prevA);                                 // edx = last frame's now3
@@ -1499,6 +1500,12 @@ static class Program
         a.L("counted");
         a.E(0x3B, 0xC1); a.J(0x76, "idle");                          // nothing due
         a.L("loop");                                                 // all but the last one
+        // [fexfix6] Several phases due in one frame (the frame took longer than a phase: a heavy battle, a hitch): the stock game
+        // never runs two logic phases without a drawn frame in between; running them back to back here corrupted game
+        // state in big matches (crash in a list unlink, or under FEX an endless fault loop = frozen game). With
+        // "multiphase" skipped only the next phase runs, through the original code, and the game falls behind the
+        // clock under load the way the stock game does.
+        if (!On("multiphase")) a.J(0xEB, "pass");
         a.E(0x8D, 0x51, 0x01, 0x3B, 0xD0); a.J(0x73, "pass");
         a.E(0x89, 0x56, ph, 0x50);                                   // [phase]=n / push eax
         a.E(0x8B, 0x04, 0x95); a.D(phaseInterp - 4); a.E(0x89, 0x46, site.Interp);   // [interp] = n/6 like stock (eax popped after)

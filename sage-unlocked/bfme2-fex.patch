@@ -1,11 +1,11 @@
---- a/Unlocker.cs
-+++ b/Unlocker.cs
+--- Unlocker.cs	2026-11-16 14:14:22
++++ Unlocker.cs	2026-11-16 14:14:22
 @@ -16,7 +16,7 @@
  
  static class Program
  {
 -    public const string Version = "1.9.6";   // keep in step with installer/setup.iss
-+    public const string Version = "1.9.6+fexfix5";   // keep in step with installer/setup.iss
++    public const string Version = "1.9.6+fexfix7";   // keep in step with installer/setup.iss
      const uint ImageBase = 0x400000;
  
      // called from inside the game (dll/proxy.c)
@@ -51,7 +51,7 @@
 +        // frame/tick ... 1.0 from that frame on. It used to be measured from tickStart, which is a sixth of a tick before
 +        // phase 1: it began at 1/6, hit 1.0 a sixth early and froze there (3-4 frames at 120 fps), then jumped: steady
 +        // movers such as birds showed missing frames five times a second.
-+        bool even = code != mem && !batches && frameClock == 0;
++        bool even = code != mem && !batches && frameClock == 0 && On("eveninterp");   // [fexfix7] skip=eveninterp: the drawn interpolation as before fexfix4
 +        uint nready = mem + 0xDC;   // [fexfix5] ticks of the other players' data waiting, read at the top of stub A
 +        uint tickBegin = mem + 0xD8, bnd = mem + 0xE0;   // time of the tick's first frame; k*T/6 for k = 0..6
          // phase k is due once
@@ -86,7 +86,7 @@
          // replay fast forward
          if (site.FfGlobal != 0) { a.E(0xA1); a.D(site.FfGlobal); a.E(0x85, 0xC0); a.J(0x74, "noff"); a.E(0x80, 0xB8); a.D(site.FfOff); a.E(0x00); a.J(0x75, "pass"); a.L("noff"); }
          a.E(0xA1); a.D(fpsVa); a.E(0x33, 0xD2, 0xB9, 0x0F, 0, 0, 0, 0xF7, 0xF1); a.E(0xA3); a.D(r);   // r = fps / 15
-@@ -1411,8 +1447,20 @@
+@@ -1411,8 +1447,21 @@
          a.E(0x8B, 0x4E, ph);                                         // ecx = phase
          a.E(0x83, 0x3D); a.D(pend); a.E(0x00); a.J(0x74, "nopend");  // started a tick last frame?
          a.E(0xC7, 0x05); a.D(pend); a.D(0);
@@ -100,6 +100,7 @@
 +        // behind the real start, so all six phases ran in the first frames of a tick and the drawn interpolation hit 1.0
 +        // early: everything moved for ~70 ms and then stood still for the rest of the 200 ms tick. When a held-back tick
 +        // finally starts, restart the schedule from the frame that started it (last frame's time = phase 1).
++        if (!On("netrestart")) a.J(0xEB, "nopend");                   // [fexfix7] skip=netrestart: the timetable is not restarted (as before fexfix3)
 +        a.E(0x83, 0x3D); a.D(held); a.E(0x00); a.J(0x74, "nopend");
 +        a.E(0xC7, 0x05); a.D(held); a.D(0);
 +        a.E(0x8B, 0x15); a.D(prevA);                                 // edx = last frame's now3
@@ -108,7 +109,7 @@
          a.L("nopend");
          a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                        // edx = t = now3 - tickStart
          a.E(0x50, 0x2B, 0x05); a.D(prevA);                           // push eax / eax = frame length
-@@ -1421,6 +1469,17 @@
+@@ -1421,6 +1470,17 @@
          a.L("lpos");
          a.E(0x83, 0xF8, 0x64); a.J(0x7E, "lok"); a.E(0xB8); a.D(100);   // clamp 0..100
          a.L("lok");
@@ -126,7 +127,20 @@
          a.E(0x03, 0xD0, 0x58);                                       // edx = t + frame length / pop eax
          a.E(0x83, 0xF9, 0x06); a.J(0x72, "mid");
          // phase 6 done
-@@ -1460,7 +1519,7 @@
+@@ -1440,6 +1500,12 @@
+         a.L("counted");
+         a.E(0x3B, 0xC1); a.J(0x76, "idle");                          // nothing due
+         a.L("loop");                                                 // all but the last one
++        // [fexfix6] Several phases due in one frame (the frame took longer than a phase: a heavy battle, a hitch): the stock game
++        // never runs two logic phases without a drawn frame in between; running them back to back here corrupted game
++        // state in big matches (crash in a list unlink, or under FEX an endless fault loop = frozen game). With
++        // "multiphase" skipped only the next phase runs, through the original code, and the game falls behind the
++        // clock under load the way the stock game does.
++        if (!On("multiphase")) a.J(0xEB, "pass");
+         a.E(0x8D, 0x51, 0x01, 0x3B, 0xD0); a.J(0x73, "pass");
+         a.E(0x89, 0x56, ph, 0x50);                                   // [phase]=n / push eax
+         a.E(0x8B, 0x04, 0x95); a.D(phaseInterp - 4); a.E(0x89, 0x46, site.Interp);   // [interp] = n/6 like stock (eax popped after)
+@@ -1460,7 +1526,7 @@
          realClockFn = 0;
          if (realclockOpt && On("realclock") && site.TimeFn != 0)
          {
@@ -135,7 +149,7 @@
              var rc = new Asm(fn);
              rc.E(0x51, 0x52); rc.Rel(0xE8, site.TimeFn);                          // push ecx / push edx / eax = ms
              rc.E(0x8B, 0x0D); rc.D(rbase); rc.E(0x85, 0xC9); rc.J(0x75, "have");    // first call: base = now
-@@ -1490,7 +1549,7 @@
+@@ -1490,7 +1556,7 @@
          {
              // #30: now3 is read when the frame starts
              uint lastT0 = mem + 0x1770, ibase = mem + 0x1774, w0 = mem + 0x1778, r0 = mem + 0x177C, rem = mem + 0x1600;   // rem: PatchClock
@@ -144,7 +158,7 @@
              var f = new Asm(fi);
              f.E(0xA1); f.D(now3); f.E(0xA3); f.D(prevNow);                   // prevNow = now3 (kept up to date)
              f.E(0xA1); f.D(t0); f.E(0x3B, 0x05); f.D(lastT0); f.J(0x74, "same");
-@@ -1510,13 +1569,22 @@
+@@ -1510,13 +1576,22 @@
          }
          else
          {
@@ -168,7 +182,7 @@
          }
          b.E(0x85, 0xC0); b.J(0x7D, "b1"); b.E(0x33, 0xC0);
          b.L("b1");
-@@ -2591,6 +2659,14 @@
+@@ -2591,6 +2666,14 @@
                  if (ex != 0 && disp != 0 && pre > adv && pre < adv + 0x40)
                      b.Sched = new SchedSite { Advance = adv, Exit = ex, Phase = phase, Interp = img[(int)(ip - ImageBase) + 24], Dispatch = disp, Tick = 3000 / 5,
                                                PreGlobal = BitConverter.ToUInt32(img, (int)(pre - ImageBase) + 2), PreOff = img[(int)(pre - ImageBase) + 8], PreFn = CallTarget(img, pre + 18) };
@@ -183,7 +197,7 @@
              }
          }
          return b;
-@@ -2599,11 +2675,12 @@
+@@ -2599,11 +2682,12 @@
      static void ApplyPatchesBfme(IntPtr proc, byte[] img, int fps, BfmeSites b)
      {
          bool sched = b.Sched != null && On("sched");
@@ -197,7 +211,7 @@
          patchMem = m; patchMemSize = 0x2000; memWrites.Clear(); memOverlaps.Clear();
          Write(proc, m, BitConverter.GetBytes(fps));
          foreach (var r in b.Restore) Write(proc, r.Item1, r.Item2);
-@@ -2631,7 +2708,7 @@
+@@ -2631,7 +2715,7 @@
          // spell store update at most every 33 ms
          if (b.StoreJmp != 0 && On("spellstore") && fps > 30)
          {
@@ -206,7 +220,7 @@
              var a = new Asm(stub);
              a.E(0x51);                                   // push ecx (the store)
              a.E(0xFF, 0x15); a.D(b.TimeIat);             // call [timeGetTime]
-@@ -2647,14 +2724,15 @@
+@@ -2647,14 +2731,15 @@
              var p = new List<byte> { 0xE9 }; p.AddRange(BitConverter.GetBytes(stub - (b.StoreJmp + 5)));
              Write(proc, b.StoreJmp, p.ToArray());
          }
@@ -224,7 +238,7 @@
          }
          FlushCode(proc);
          Func<IEnumerable<uint>, string> hex = l => string.Join(" ", l.Where(a => a != 0).Select(a => "0x" + a.ToString("X")));
-@@ -2797,6 +2875,15 @@
+@@ -2797,6 +2882,15 @@
      const uint MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, PAGE_EXECUTE_READWRITE = 0x40;
  
      // memory helpers

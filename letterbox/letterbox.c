@@ -55,7 +55,9 @@ static struct {
 
 /* letterbox.ini next to the dll: [letterbox] vsync=-1 keep the game's choice, 0 off, 1 on */
 static int cfg_vsync = -1;
+static int cfg_watch = 1;        /* watch=0: no watchdog thread; 1: it reports when no frame was finished for 4 s; 2: it also samples frames that take over 60 ms */
 static int cfg_sample;           /* sample=1 (or the test command "sample 1"): sampling profiler, see sample_tick */
+static int cfg_dark;             /* dark=1 (test aid): show a black screen instead of the picture (letterboxed pictures only); screenshots still work */
 static int cfg_showfps = 0;      /* showfps=1 or Ctrl+Shift+F in the game: frame rate in the top-left corner (in the black bar when there is one) */
 /* topinset=N in letterbox.ini: rows at the top of the screen to leave black (the camera housing of a MacBook display).
  * The launch wrapper measures it for the current main display and writes it before every start. */
@@ -1027,7 +1029,7 @@ static DWORD WINAPI wd_thread(void *arg)
             continue;
         }
         still = now - last_change;
-        if (still >= 60 && ne < 8)
+        if (cfg_watch >= 2 && still >= 60 && ne < 8)
         {
             CONTEXT c;
             if (wd_sample(&c, rets, 14, &nr)) eips[ne++] = c.Eip;
@@ -1057,6 +1059,7 @@ static void wd_start(void)
     static BOOL once;
     if (once) return;
     once = TRUE;
+    if (!cfg_watch && !cfg_sample) return;
     g_main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
     if (!g_main_thread || !CreateThread(NULL, 0, wd_thread, NULL, 0, NULL)) logf("watchdog: not started (err %u)", GetLastError());
 }
@@ -1233,32 +1236,45 @@ static void prof_window(DWORD frames)
  * spent half its time waiting for that. With spinwait the helper thread stays awake (spinning) for up to that many
  * microseconds before it really sleeps, and the game's thread waits by spinning instead of by yield system calls. */
 static int cfg_spinwait;
-static BOOL (WINAPI *o_w3d_SleepCV)(CONDITION_VARIABLE *, CRITICAL_SECTION *, DWORD);
 static LONG (WINAPI *o_w3d_Delay)(BOOLEAN, const LARGE_INTEGER *);
 static DWORD g_spin_cv, g_spin_cv_slept, g_spin_delay, g_main_tid;
-static BOOL WINAPI h_w3d_SleepCV(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms)
+/* wined3d's command thread sleeps through a function pointer it looks up in ntdll at start (NtWaitForAlertByThreadId;
+ * the pointer is a global read in wined3d_cs_run: mov eax,[ptr] / test eax,eax / je / push ecx / push 0 / call eax).
+ * The replacement first polls with a zero timeout for up to the budget, then sleeps as before. */
+static LONG (WINAPI *o_w3d_WaitAlert)(const void *, const LARGE_INTEGER *);
+static LONG WINAPI h_w3d_WaitAlert(const void *addr, const LARGE_INTEGER *timeout)
 {
-    static DWORD tid; static unsigned long long period_start, last_ret;
-    unsigned long long now, budget = (unsigned long long)g_tsc_per_us_x16 * cfg_spinwait / 16, gap = (unsigned long long)g_tsc_per_us_x16 * 4 / 16;
-    BOOL r;
-    if (!budget || ms != INFINITE || (tid && tid != cur_tid())) return o_w3d_SleepCV(cv, cs, ms);
-    tid = cur_tid();
-    now = tsc();
-    if (now - last_ret > gap) period_start = now;            /* not called again right after an early return: a new idle period */
-    if (now - period_start < budget)
+    static const LARGE_INTEGER zero;
+    unsigned long long budget = (unsigned long long)g_tsc_per_us_x16 * cfg_spinwait / 16;
+    if (budget && (!timeout || timeout->QuadPart))
     {
-        int i;
-        LeaveCriticalSection(cs);
-        for (i = 0; i < 24; i++) YieldProcessor();
-        EnterCriticalSection(cs);
-        g_spin_cv++;
-        last_ret = tsc();
-        return TRUE;                                         /* an early wake-up: the caller looks at its queues again */
+        unsigned long long start = tsc();
+        do
+        {
+            LONG r = o_w3d_WaitAlert(addr, &zero);
+            int i;
+            if (r != 0x102 /* STATUS_TIMEOUT */) { g_spin_cv++; return r; }
+            for (i = 0; i < 12; i++) YieldProcessor();
+        } while (tsc() - start < budget);
+        g_spin_cv_slept++;
     }
-    g_spin_cv_slept++;
-    r = o_w3d_SleepCV(cv, cs, ms);
-    last_ret = 0;
-    return r;
+    return o_w3d_WaitAlert(addr, timeout);
+}
+static BOOL spin_hook_wait(BYTE *base)
+{
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    BYTE *p = base + sec->VirtualAddress, *end = p + sec->Misc.VirtualSize - 20, *hit = NULL;
+    void **slot;
+    for (; p < end; p++)
+        if (p[0] == 0xA1 && p[5] == 0x85 && p[6] == 0xC0 && p[7] == 0x0F && p[8] == 0x84 && p[13] == 0x51 && p[14] == 0x6A && p[15] == 0x00 && p[16] == 0xFF && p[17] == 0xD0)
+        { if (hit) return FALSE; hit = p; }                 /* must be the only place */
+    if (!hit) return FALSE;
+    slot = *(void ***)(hit + 1);
+    if (IsBadWritePtr(slot, 4) || !*slot) return FALSE;
+    o_w3d_WaitAlert = *slot;
+    *slot = h_w3d_WaitAlert;
+    return TRUE;
 }
 static LONG WINAPI h_w3d_Delay(BOOLEAN alertable, const LARGE_INTEGER *timeout)
 {
@@ -1286,11 +1302,9 @@ static void spin_install(void)
     if (once || !cfg_spinwait || !w) return;
     once = TRUE;
     g_main_tid = GetCurrentThreadId();
-    o_w3d_SleepCV = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SleepConditionVariableCS");
     o_w3d_Delay = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution");
-    if (o_w3d_SleepCV) iat_hook(w, "kernel32.dll", "SleepConditionVariableCS", h_w3d_SleepCV);
     if (o_w3d_Delay) iat_hook(w, "ntdll.dll", "NtDelayExecution", h_w3d_Delay);
-    logf("spinwait: the Direct3D helper thread stays awake up to %d us before sleeping", cfg_spinwait);
+    logf("spinwait: the Direct3D helper thread %s", spin_hook_wait((BYTE *)w) ? "polls before it sleeps" : "could not be hooked (its wait was not found)");
 }
 
 /* ---- noglcheck=1: Wine's Direct3D stops asking OpenGL for an error code after every call ----
@@ -1299,7 +1313,7 @@ static void spin_install(void)
  * the emulator every OpenGL call is a costly crossing, and this doubles their number. The check only ever prints a
  * message. Clearing the channel's flags in wined3d's memory turns it off (the same as WINEDEBUG=-d3d, which this
  * runner does not start with). */
-static int cfg_noglcheck;
+static int cfg_noglcheck = 1;
 static void noglcheck_install(void)
 {
     static BOOL once;
@@ -1408,7 +1422,7 @@ static void cswait_install(void)
     iat_hook(w, "kernel32.dll", "WaitForSingleObject", h_csw_Wait);
     iat_hook(w, "kernel32.dll", "EnterCriticalSection", h_csw_Enter);
     o_csw_SleepCV = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SleepConditionVariableCS");
-    if (!cfg_spinwait) iat_hook(w, "kernel32.dll", "SleepConditionVariableCS", h_csw_SleepCV);
+    iat_hook(w, "kernel32.dll", "SleepConditionVariableCS", h_csw_SleepCV);
 }
 static void cswait_report(DWORD frames)
 {
@@ -1460,6 +1474,7 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
     fr.scenes++;
     return hr;
 }
+static DWORD g_holds, g_hold_frames, g_hold_longest, g_ticks_seen;   /* per window: ticks the engine held back */
 static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
 static HRESULT WINAPI lb_DIP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
 { fr.draws++; g_win_draws++; return o_DIP(dev, t, base, minv, nv, start, prims); }
@@ -2236,6 +2251,13 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         g_frame_no++;
         g_wd_frames++;
         if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40) && *(DWORD *)((BYTE *)*eng + 0x34) != 1) g_seen_other_phase = TRUE;
+        if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x60))
+        {
+            /* the engine's tick did not start this frame (phase counter above 6): how often, and for how many frames in a row */
+            static DWORD run, last_tick; DWORD ph = *(DWORD *)((BYTE *)*eng + 0x34), tick = *(DWORD *)((BYTE *)*eng + 0x50);
+            if (ph > 6) { g_hold_frames++; if (!run) g_holds++; run++; if (run > g_hold_longest) g_hold_longest = run; } else run = 0;
+            if (tick != last_tick) { g_ticks_seen++; last_tick = tick; }
+        }
     }
     ZeroMemory(&fr, sizeof(fr));
     fr.frame_start = qpc;
@@ -2268,6 +2290,8 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         if (frames) logf("  per frame: %u draws, %u vertex-buffer locks, %u index-buffer locks", g_win_draws / frames, g_win_vblocks / frames, g_win_iblocks / frames);
         g_win_draws = g_win_vblocks = g_win_iblocks = 0;
         { static DWORD kb_said, dec_said; if (g_heap_reserved_kb != kb_said || g_heap_decommits != dec_said) { logf("  heapkeep: %u MB of the game's reserved heap ranges kept committed so far, %u decommits kept accessible", g_heap_reserved_kb >> 10, g_heap_decommits); kb_said = g_heap_reserved_kb; dec_said = g_heap_decommits; } }
+        logf("  logic: %u ticks started; a tick was held back %u times, %u frames in all, longest %u frames", g_ticks_seen, g_holds, g_hold_frames, g_hold_longest);
+        g_holds = g_hold_frames = g_hold_longest = g_ticks_seen = 0;
         cswait_report(frames);
         prof_window(frames);
         if (cfg_spinwait && frames) { logf("  spinwait: per frame the helper thread stayed awake %u times and went to sleep %u times; the game's thread spun %u times", g_spin_cv / frames, g_spin_cv_slept / frames, g_spin_delay / frames); g_spin_cv = g_spin_cv_slept = g_spin_delay = 0; }
@@ -2293,7 +2317,8 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
             }
             if (g.dst.top > 0) { SetRect(&r, 0, 0, g.sw, g.dst.top); IDirect3DDevice9_ColorFill(dev, bb, &r, 0); }
             if (g.dst.bottom < (LONG)g.sh) { SetRect(&r, 0, g.dst.bottom, g.sw, g.sh); IDirect3DDevice9_ColorFill(dev, bb, &r, 0); }
-            IDirect3DDevice9_StretchRect(dev, g.rt, NULL, bb, &g.dst,
+            if (cfg_dark) IDirect3DDevice9_ColorFill(dev, bb, &g.dst, 0);      /* dark=1: the game draws as usual, the screen stays black */
+            else IDirect3DDevice9_StretchRect(dev, g.rt, NULL, bb, &g.dst,
                     (g.dw == g.gw && g.dh == g.gh) ? D3DTEXF_NONE : D3DTEXF_LINEAR);
             if (cfg_showfps) draw_fps(dev, bb);
             if (shot_bb_name[0]) { shot_from_bb = TRUE; save_shot(dev, shot_bb_name, 3); shot_from_bb = FALSE; shot_bb_name[0] = 0; }
@@ -2536,10 +2561,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_topinset = GetPrivateProfileIntW(L"letterbox", L"topinset", 0, ini);
             cfg_valign = (int)GetPrivateProfileIntW(L"letterbox", L"valign", 0, ini);
             cfg_showfps = (int)GetPrivateProfileIntW(L"letterbox", L"showfps", 0, ini);
+            cfg_dark = (int)GetPrivateProfileIntW(L"letterbox", L"dark", 0, ini);
             cfg_profile = (int)GetPrivateProfileIntW(L"letterbox", L"profile", 0, ini);
             cfg_sample = (int)GetPrivateProfileIntW(L"letterbox", L"sample", 0, ini);
             cfg_spinwait = (int)GetPrivateProfileIntW(L"letterbox", L"spinwait", 0, ini);
-            cfg_noglcheck = (int)GetPrivateProfileIntW(L"letterbox", L"noglcheck", 0, ini);
+            cfg_noglcheck = (int)GetPrivateProfileIntW(L"letterbox", L"noglcheck", 1, ini);
+            cfg_watch = (int)GetPrivateProfileIntW(L"letterbox", L"watch", 1, ini);
             cfg_heapkeep = (int)GetPrivateProfileIntW(L"letterbox", L"heapkeep", 1, ini);
             cfg_cswait = (int)GetPrivateProfileIntW(L"letterbox", L"cswait", 0, ini);
             cfg_roundbuttons = (int)GetPrivateProfileIntW(L"letterbox", L"roundbuttons", 1, ini);

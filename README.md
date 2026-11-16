@@ -22,6 +22,8 @@ No game files are included. You need your own installation of the game.
 | 16:9 trims the top and bottom of what 4:3 shows | The camera's field of view is widened so the 4:3 height is kept and the sides are added (`horplus`). |
 | Round command buttons over buildings are ovals at 16:9 | Drawn round. |
 | In a network game a machine that falls behind the other (a hitch, a long load) crawls at 5–15 fps for minutes and cannot catch up | Fixed in the patched SAGE Unlocked: while several ticks of the other side's data are waiting, the game's own catch-up runs (ticks back to back) instead of the unlocker's timetable; with 2–3 waiting the timetable runs at double speed. Level again within seconds. |
+| The game freezes for good in a long or big match (one thread at 100 %, no more frames) | A write of the game into a part of its own heap that is not committed is a crash on Windows; the FEX emulator turns it into an endless fault loop. `heapkeep` in `letterbox/d3d9.dll` keeps the game's reserved heap ranges accessible, so the write lands in unused memory. (What makes the game write there is a separate, open problem, see below.) |
+| Low frame rate in battles although the GPU is idle | Measured with the proxy's own profilers: Wine's Direct3D 9 runs on macOS OpenGL with a helper thread, every vertex-buffer write of the game is a synchronous round trip to that thread, and every OpenGL call is an expensive emulator crossing. `noglcheck` stops the error query after each OpenGL call (+12 %), `spinwait` keeps the helper thread polling instead of sleeping between the round trips (+12 %). |
 | In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
 | The two start-up loading pictures are 4:3 | Optional: `widescreen-art/loading-screen/` rebuilds both as real 16:9 pictures from a still of the film shot they were made from (you supply the still), carries the pictures' own shading into the new sides, continues the ornament band of the second one (the socket of the spinning ring stays where the game draws the ring) and sharpens them with Real-ESRGAN. |
@@ -94,12 +96,23 @@ BFME_URL="steam://rungameid/<game id of the shortcut>"
   `RES="1920 1080"`, `FPS=60`, `INSET=0`, `VALIGN=top`.
 - An empty file `sage-unlocked/disabled` starts the game without the frame-rate unlock (stock 30 fps).
 
+## Big matches and the even interpolation
+
+`sage-unlocked/files/SAGEUnlocked.ini` ships with `skip=eveninterp`: the drawn interpolation that runs evenly over a
+logic tick (steady movers no longer hitch five times a second) is switched off. With it on, an 8-player skirmish
+against Brutal AIs crashed or froze after 6-18 minutes in seven runs out of seven (a crash in a list unlink of the
+game's collision manager, `game.dat` 0xB6DD43 / 0x404A21; under FEX the same fault could also become the endless fault
+loop that `heapkeep` now prevents). With it off: five runs of 22-32 minutes, one fault. At the stock 30 fps
+(`sage-unlocked/disabled`): none. Why interpolation values below phase/6 damage the collision bookkeeping is not found
+yet; `soak.sh` reproduces it (`FRESH=1 ./soak.sh 30` with an 8-player setup).
+
 ## Test aids
 
 The proxy reads a command file (`letterbox.cmd` in the game folder): screenshots of the game's own frame, mouse
 moves and clicks, a per-frame recorder (brightness, frame time), memory peeks. The scripts in the root use it:
 `enter-skirmish.sh`, `scroll-test.sh`, `tickrate.sh`, `interp-trace.sh`, `menu-rec.sh`, `select-rec.sh`,
-`ring-rec.sh`, `bring-rec.sh`, `lan-lobby.sh`, `lan-match.sh`. They need no screen-recording permission.
+`ring-rec.sh`, `bring-rec.sh`, `lan-lobby.sh`, `lan-match.sh`, `bench.sh` (load a saved skirmish and measure the
+frame rate), `soak.sh` (let a save or a fresh skirmish run and report a crash or freeze), `renderer.sh`. They need no screen-recording permission.
 
 ## Licence
 
