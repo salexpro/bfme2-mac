@@ -2127,6 +2127,93 @@ __attribute__((naked)) static void h_SetViewPlane(void)    /* thiscall (camera; 
             "jmp *_p_set_view_plane\n");
 }
 
+/* ---- a unit far outside the map (farguard=1, the default) ----
+ * In big matches a unit can end up billions of units outside the map (seen: a Goblin Cave Troll at x = 5.6e9,
+ * y = -6.9e9; what moves it there is not known yet). Nothing happens until the game's collision manager next works
+ * on it: with coordinates that large it files the unit's extent under a wild index (a write far outside its table:
+ * the endless fault loop under FEX) and, because the extent has no width in single precision, later meets the end
+ * of the extent before its start and unlinks an object it never linked (access violation at 0xB6DD43).
+ *
+ * The collision manager (the object at [0xde4360]; its work is done by the object at +10h of it) keeps the records
+ * it has to work on in a list: first one at +8 of that object, next one at record+14h. A record has the collision
+ * part of its game object at +4 (0 when the object is gone) and the game object itself at +A0h, whose position is
+ * at +14h (x) and +24h (y), with a copy at +38h and +3Ch. The manager's update is a virtual function (0xb6c420,
+ * the only pointer to it is the table entry at 0xd0bf30). That entry is pointed here: before every update the
+ * list is walked, and a unit beyond +-100000 (maps are a few thousand wide) is handed to the manager's own
+ * "forget this object" routine (0xb6c480). The unit stays where it is, the collision manager just no longer
+ * knows it; the log says which unit it was and where it stood the last time it moved. In a network game all
+ * machines must run the same proxy, as for everything else that touches the game's logic. */
+#define FAR_LIMIT 100000.0f
+static int cfg_farguard = 1;
+static struct far_slot { DWORD rec; float x, y; } g_far[2048];
+static DWORD g_far_notes, g_far_removed;
+typedef void (__attribute__((thiscall)) *coll_forget_fn)(void *mgr, void *part);
+static int whole(float v)                  /* a float for wsprintf: whole units, clamped */
+{
+    if (v != v) return 0x7fffffff;
+    if (v > 2.0e9f) return 2000000000;
+    if (v < -2.0e9f) return -2000000000;
+    return (int)v;
+}
+__attribute__((used)) static void __cdecl far_guard(DWORD mgr)
+{
+    DWORD work, rec, part[16], walked = 0, n = 0, i;
+    if (mgr < 0x10000) return;
+    work = *(const DWORD *)(ULONG_PTR)(mgr + 0x10);
+    if (work < 0x10000 || !*(const DWORD *)(ULONG_PTR)work) return;         /* the update itself does nothing then */
+    for (rec = *(const DWORD *)(ULONG_PTR)(work + 8); rec >= 0x10000 && walked < 50000; rec = *(const DWORD *)(ULONG_PTR)(rec + 0x14), walked++)
+    {
+        DWORD pt = *(const DWORD *)(ULONG_PTR)(rec + 4), own = *(const DWORD *)(ULONG_PTR)(rec + 0xa0);
+        struct far_slot *s = &g_far[(rec >> 3) & 2047];
+        const DWORD *q;
+        float x, y;
+        BOOL known;
+        if (pt < 0x10000 || own < 0x10000) continue;
+        q = (const DWORD *)(ULONG_PTR)own;
+        if (q[5] != q[14] || q[9] != q[15]) continue;         /* not a game object with its position where we expect it */
+        x = *(const float *)&q[5]; y = *(const float *)&q[9];
+        known = s->rec == rec;
+        if (x != x || y != y || x > FAR_LIMIT || x < -FAR_LIMIT || y > FAR_LIMIT || y < -FAR_LIMIT)
+        {
+            if (n < 16) part[n++] = pt;
+            if (g_far_notes < 40)
+            {
+                DWORD tmpl = q[1];
+                g_far_notes++;
+                logf("far object: a unit at x %d, y %d, z %d (%08x %08x %08x) is taken out of the collision manager; it last moved from x %d, y %d%s; record %08x, object %08x, id %u",
+                     whole(x), whole(y), whole(*(const float *)&q[13]), q[5], q[9], q[13], known ? whole(s->x) : 0, known ? whole(s->y) : 0,
+                     known ? "" : " (not seen moving before)", rec, own, *(const DWORD *)(ULONG_PTR)(rec + 0x9c));
+                if (mem_ok(tmpl, 0x30)) { g_names_left = 1; note_text(*(const DWORD *)(ULONG_PTR)(tmpl + 0x2c), "its kind"); }
+            }
+        }
+        s->rec = rec; s->x = x; s->y = y;
+    }
+    for (i = 0; i < n; i++) ((coll_forget_fn)0xb6c480)((void *)(ULONG_PTR)mgr, (void *)(ULONG_PTR)part[i]);
+    g_far_removed += n;
+}
+__attribute__((used)) static const DWORD p_coll_update = 0xb6c420;
+__attribute__((naked)) static void h_CollUpdate(void)      /* stands in the table for the manager's update; the manager is in ecx */
+{
+    __asm__(HOOK_SAVE
+            "pushl 24(%ebp)\n"
+            "call _far_guard\n"
+            "addl $4, %esp\n"
+            HOOK_RESTORE
+            "jmp *_p_coll_update\n");
+}
+static void far_guard_install(void)
+{
+    DWORD *slot = (DWORD *)0xd0bf30, old;
+    if (!cfg_farguard) return;
+    if (!IsBadReadPtr(slot, 4) && *slot == 0xb6c420 && VirtualProtect(slot, 4, PAGE_READWRITE, &old))
+    {
+        *slot = (DWORD)(ULONG_PTR)h_CollUpdate;
+        VirtualProtect(slot, 4, old, &old);
+        logf("far-object guard: on");
+    }
+    else logf("far-object guard: NOT applied (unexpected code)");
+}
+
 static void patch_game_code(void)
 {
     static const DWORD tint_sites[] = { 0x6757aa, 0x67597d, 0x675dd1, 0x675e1c, 0x675e86, 0x675ed4, 0x67910e };
@@ -2137,6 +2224,7 @@ static void patch_game_code(void)
         r[0] = 0xE8; memcpy(r + 1, &rel, 4); memset(r + 5, 0x90, 5);
         logf("frame limiter guard (a frame waits 100 ms at most): %s", patch_bytes(0x63a1b2, lim_old, r, 10) ? "on" : "NOT applied (unexpected code)");
     }
+    far_guard_install();
     if (cfg_roundbuttons)
     {
         /* both size queries of the draw routine (picture, then ring/overlays) use the same four locals */
@@ -2784,6 +2872,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_logicinterp = (int)GetPrivateProfileIntW(L"letterbox", L"logicinterp", 1, ini);
             cfg_firstphase = (int)GetPrivateProfileIntW(L"letterbox", L"firstphase", 1, ini);
             cfg_horplus = (int)GetPrivateProfileIntW(L"letterbox", L"horplus", 1, ini);
+            cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
