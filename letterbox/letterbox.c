@@ -1723,9 +1723,9 @@ static BOOL ring_is_it(IDirect3DDevice9 *dev, IDirect3DBaseTexture9 *tex, INT ba
             }
             IDirect3DVertexBuffer9_Unlock(vb);
             {
-                /* The ring's quad: 6 to 25 % of the screen wide, centred, in the lower part of the screen, and a
-                 * square once its width is corrected (within 8 %). Other small 64x64 quads down there (an icon
-                 * 23 pixels wide was one) are not. */
+                /* The ring's quad: 3 to 12.5 % of the screen wide (0.06 to 0.25 in clip units), centred, in the
+                 * lower part of the screen, and a square once its width is corrected (within 8 %). Other small
+                 * quads with such a texture down there (an icon 23 pixels wide was one) are not. */
                 float w = x1 - x0, h = y1 - y0, cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
                 float wpx = w * (float)g.gw * ((4.0f / 3.0f) * (float)g.gh / (float)g.gw), hpx = h * (float)g.gh;
                 if (w > 0.06f && w < 0.25f && cx > -0.05f && cx < 0.05f && cy < -0.4f && hpx > 0.0f && wpx > hpx * 0.92f && wpx < hpx * 1.08f)

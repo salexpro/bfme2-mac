@@ -153,8 +153,9 @@ def main():
         if blob and any(n.lower().endswith('titlescreenuserinterface.jpg') for n, _ in files):
             im = Image.open(io.BytesIO(blob)).convert('RGBA')
             w, h = im.size; nw = max(1, round(w * k))
-            canvas = Image.new('RGBA', (w, h), (255, 255, 255, 255))
-            canvas.paste(im.resize((nw, h), Image.LANCZOS), ((w - nw) // 2, 0))
+            alpha = Image.new('L', (w, h), 255)                  # only the alpha is resized: the colour stays as it is
+            alpha.paste(im.getchannel('A').resize((nw, h), Image.LANCZOS), ((w - nw) // 2, 0))
+            canvas = im.copy(); canvas.putalpha(alpha)
             buf = io.BytesIO(); canvas.save(buf, format='PNG')
             files.append((name, buf.getvalue()))
             print('%s (the title screen\'s mask) %dx%d from %s squeezed to %d wide' % (name.split('\\')[-1], w, h, src, nw))
