@@ -2,7 +2,7 @@
 # Test automation: (re)start BFME II from Steam and click through to a running skirmish on the default map.
 # Click positions are fractions of the game's resolution (read from the letterbox log), so any resolution works.
 . "$(dirname "$0")/env.sh"; need_steam
-pkill -f "game.dat"; pkill -f lotrbfme2
+pkill -x game.dat; pkill -f lotrbfme2
 for i in $(seq 1 30); do tail -1 "$CD/notproton-run.log" 2>/dev/null | grep -q "session ending" && break; sleep 1; done
 rm -f "${G:?}/letterbox.log" "${G:?}/letterbox.cmd"
 open "$URL"

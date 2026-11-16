@@ -15,6 +15,7 @@
 #define CINTERFACE
 #define COBJMACROS
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d9.h>
 #include <wchar.h>
 #include <stdarg.h>
@@ -54,6 +55,7 @@ static struct {
 
 /* letterbox.ini next to the dll: [letterbox] vsync=-1 keep the game's choice, 0 off, 1 on */
 static int cfg_vsync = -1;
+static int cfg_sample;           /* sample=1 (or the test command "sample 1"): sampling profiler, see sample_tick */
 static int cfg_showfps = 0;      /* showfps=1 or Ctrl+Shift+F in the game: frame rate in the top-left corner (in the black bar when there is one) */
 /* topinset=N in letterbox.ini: rows at the top of the screen to leave black (the camera housing of a MacBook display).
  * The launch wrapper measures it for the current main display and writes it before every start. */
@@ -693,6 +695,7 @@ static void run_commands(IDirect3DDevice9 *dev)
     if (*e) { *e = 0; cmd_pos = e + 1; } else cmd_pos = e;
     for (e = line; *e; e++) if (*e == '\r') *e = 0;
     if (!*line) return;
+    if (!strncmp(line, "sample ", 7)) { a = line + 7; cfg_sample = next_int(&a); logf("cmd: sample %d", cfg_sample); return; }   /* sampling profiler on/off */
     if (!strncmp(line, "shot ", 5)) { save_shot(dev, line + 5, 3); return; }
     if (!strncmp(line, "shot1 ", 6)) { save_shot(dev, line + 6, 1); return; }
     if (!strncmp(line, "shotbb ", 7)) { lstrcpynA(shot_bb_name, line + 7, sizeof(shot_bb_name)); return; }
@@ -753,10 +756,677 @@ static void run_commands(IDirect3DDevice9 *dev)
     logf("cmd: unknown '%s'", line);
 }
 
+static WCHAR cfg_real[64];           /* real=<file in the game folder>: use that Direct3D 9 library instead of the system's (experiments) */
+/* ---- watchdog: when the game's thread has not finished a frame for a few seconds, say where it is ----
+ * A second thread looks once a second. After 4 s without a frame (and then every 10 s) it stops the game's thread
+ * for a moment, reads its registers and the return addresses on its stack, and writes them to the log. A map load
+ * also draws nothing for a while, so the first lines of a match are normal; a freeze shows as lines that never end. */
+static HANDLE g_main_thread;
+static volatile DWORD g_wd_frames;      /* bumped by the game's thread once per frame */
+static void wd_describe(DWORD addr, char *out)
+{
+    HMODULE m = NULL;
+    MEMORY_BASIC_INFORMATION mbi;
+    char name[MAX_PATH], *base;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(ULONG_PTR)addr, &m) && m
+        && GetModuleFileNameA(m, name, sizeof(name)))
+    {
+        base = strrchr(name, '\\'); base = base ? base + 1 : name;
+        wsprintfA(out, "%s+%x", base, addr - (DWORD)(ULONG_PTR)m);
+    }
+    else if (VirtualQuery((void *)(ULONG_PTR)addr, &mbi, sizeof(mbi)))
+        wsprintfA(out, "allocated memory (base %p, protect %x, type %x)", mbi.AllocationBase, (unsigned)mbi.Protect, (unsigned)mbi.Type);
+    else lstrcpyA(out, "unmapped");
+}
+/* ---- sample=1: where the game's thread and its busiest helper thread spend their time ----
+ * The watchdog thread stops a thread every few milliseconds, notes the instruction pointer (and, when that is inside
+ * ntdll, the first return address on the stack that is not) and lets it go on. Every 10 s the log gets, for the
+ * game's thread and for the other thread that used most processor time: the share of each module, the busiest places
+ * (16-byte buckets, named after the nearest export) and the busiest callers into ntdll. */
+static struct { DWORD base, size; char name[28]; } smod[64];
+static int nsmod;
+struct sampler { DWORD total, nomod, modn[64]; struct { DWORD key, n; } bucket[8192], caller[4096]; };
+static struct sampler s_main, s_side_s;
+static struct { DWORD esp[0x100]; } s_stack;
+static int smod_find(DWORD addr, BOOL add)
+{
+    int i;
+    for (i = 0; i < nsmod; i++) if (addr - smod[i].base < smod[i].size) return i;
+    if (add && nsmod < 64)
+    {
+        HMODULE m = NULL; char path[MAX_PATH], *b;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(ULONG_PTR)addr, &m)
+            || !m || !GetModuleFileNameA(m, path, sizeof(path))) return -1;
+        b = strrchr(path, '\\'); b = b ? b + 1 : path;
+        smod[i].base = (DWORD)(ULONG_PTR)m;
+        smod[i].size = ((IMAGE_NT_HEADERS *)((BYTE *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew))->OptionalHeader.SizeOfImage;
+        lstrcpynA(smod[i].name, b, sizeof(smod[i].name));
+        return nsmod++;
+    }
+    return -1;
+}
+static void sbucket_add(void *table, DWORD mask, DWORD key)
+{
+    struct { DWORD key, n; } *tb = table; DWORD h, tries = 0;
+    for (h = (key * 2654435761u >> 16) & mask; tries++ <= mask; h = (h + 1) & mask)
+    {
+        if (tb[h].n && tb[h].key == key) { tb[h].n++; return; }
+        if (!tb[h].n) { tb[h].key = key; tb[h].n = 1; return; }
+    }
+}
+/* "module!export+offset" for an address (the nearest export below it), or "module+offset" */
+static void s_name(DWORD addr, char *out)
+{
+    int i = smod_find(addr, TRUE);
+    BYTE *base; IMAGE_NT_HEADERS *nt; IMAGE_EXPORT_DIRECTORY *ex; DWORD *names, *funcs, k, best = 0, rva; WORD *ords; const char *bn = NULL;
+    if (i < 0) { wsprintfA(out, "%x", addr); return; }
+    base = (BYTE *)(ULONG_PTR)smod[i].base; rva = addr - smod[i].base;
+    nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size)
+    {
+        ex = (IMAGE_EXPORT_DIRECTORY *)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+        names = (DWORD *)(base + ex->AddressOfNames); funcs = (DWORD *)(base + ex->AddressOfFunctions); ords = (WORD *)(base + ex->AddressOfNameOrdinals);
+        for (k = 0; k < ex->NumberOfNames; k++)
+        {
+            DWORD f = funcs[ords[k]];
+            if (f <= rva && f > best) { best = f; bn = (const char *)(base + names[k]); }
+        }
+    }
+    if (bn && rva - best < 0x4000) wsprintfA(out, "%s!%.40s+%x", smod[i].name, bn, rva - best);
+    else wsprintfA(out, "%s+%x", smod[i].name, rva);
+}
+static void sample_add(struct sampler *s, const CONTEXT *c)
+{
+    int i = smod_find(c->Eip, TRUE);
+    s->total++;
+    if (i < 0) { s->nomod++; return; }
+    s->modn[i]++;
+    sbucket_add(s->bucket, 8191, c->Eip >> 4);
+    if (!lstrcmpiA(smod[i].name, "ntdll.dll"))
+    {
+        DWORD k; BOOL inner = FALSE;
+        for (k = 0; k < 0x100; k++)       /* who called: the first return address inside ntdll and the first outside it (from the copy of the thread's stack) */
+        {
+            DWORD v = s_stack.esp[k];
+            if (v < 0x10000) continue;
+            if (v - smod[i].base < smod[i].size)
+            {
+                if (!inner && (v >> 4) != (c->Eip >> 4) && k < 0x40) { sbucket_add(s->caller, 4095, v >> 4); inner = TRUE; }
+                continue;
+            }
+            if (smod_find(v, FALSE) >= 0) { sbucket_add(s->caller, 4095, v >> 4); break; }
+        }
+    }
+}
+static void s_top(struct sampler *s, void *table, int size, int count, const char *what)
+{
+    struct { DWORD key, n; } *tb = table; char line[1000], nm[120]; int len = 0, i, k;
+    for (k = 0; k < count; k++)
+    {
+        int best = -1;
+        for (i = 0; i < size; i++) if (tb[i].n && (best < 0 || tb[i].n > tb[best].n)) best = i;
+        if (best < 0 || tb[best].n * 1000 < s->total * 5 || len > 860) break;          /* below 0.5 % */
+        s_name(tb[best].key << 4, nm);
+        len += wsprintfA(line + len, " %s %u.%u%%;", nm, tb[best].n * 100 / s->total, tb[best].n * 1000 / s->total % 10);
+        tb[best].n = 0;
+    }
+    if (len) logf("    %s:%s", what, line);
+}
+static void sampler_report(struct sampler *s, const char *who)
+{
+    char line[900]; int len = 0, i, k;
+    if (s->total)
+    {
+        for (k = 0; k < 9; k++)
+        {
+            int best = -1;
+            for (i = 0; i < nsmod; i++) if (s->modn[i] && (best < 0 || s->modn[i] > s->modn[best])) best = i;
+            if (best < 0) break;
+            len += wsprintfA(line + len, " %s %u.%u%%", smod[best].name, s->modn[best] * 100 / s->total, s->modn[best] * 1000 / s->total % 10);
+            s->modn[best] = 0;
+        }
+        logf("  sample: %u samples of %s:%s, outside any module %u.%u%%", s->total, who, line, s->nomod * 100 / s->total, s->nomod * 1000 / s->total % 10);
+        s_top(s, s->bucket, 8192, 14, "busiest places");
+        s_top(s, s->caller, 4096, 12, "who called into ntdll (inside it, and from outside)");
+    }
+    ZeroMemory(s, sizeof(*s));
+}
+/* the helper threads of the Direct3D implementation: the threads that were started inside wined3d.dll (its command
+ * thread) or inside the library named by real= */
+static HANDLE s_side[6]; static int s_nside; static char s_side_mod[28];
+static DWORD s_side_eip, s_side_stack[0x60];      /* the helper thread's last sample inside ntdll: where it was and its stack */
+static void pick_side_threads(void)
+{
+    static LONG (WINAPI *query)(HANDLE, int, void *, ULONG, ULONG *);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; DWORD pid = GetCurrentProcessId(), me = GetCurrentThreadId(), main_tid = GetThreadId(g_main_thread);
+    char real[64]; int i;
+    if (snap == INVALID_HANDLE_VALUE) return;
+    if (!query) query = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    for (i = 0; i < s_nside; i++) CloseHandle(s_side[i]);
+    s_nside = 0;
+    WideCharToMultiByte(CP_ACP, 0, cfg_real, -1, real, sizeof(real), NULL, NULL);
+    te.dwSize = sizeof(te);
+    if (query && Thread32First(snap, &te)) do
+    {
+        HANDLE h; DWORD start = 0; int m;
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || te.th32ThreadID == main_tid || s_nside == 6) continue;
+        if (!(h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID))) continue;
+        query(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), NULL);
+        m = start ? smod_find(start, TRUE) : -1;
+        if (m >= 0 && (!lstrcmpiA(smod[m].name, "wined3d.dll") || (real[0] && !lstrcmpiA(smod[m].name, real))))
+        { s_side[s_nside++] = h; lstrcpynA(s_side_mod, smod[m].name, sizeof(s_side_mod)); }
+        else CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+}
+static BOOL sample_thread(HANDLE th, CONTEXT *c)
+{
+    ZeroMemory(c, sizeof(*c)); c->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (SuspendThread(th) == (DWORD)-1) return FALSE;
+    if (!GetThreadContext(th, c)) { ResumeThread(th); return FALSE; }
+    {
+        /* a thread that waits near the top of its stack has less than the full window above its stack pointer */
+        MEMORY_BASIC_INFORMATION mbi; SIZE_T n = 0;
+        ZeroMemory(&s_stack, sizeof(s_stack));
+        if (c->Esp && VirtualQuery((void *)(ULONG_PTR)c->Esp, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        {
+            n = (SIZE_T)((BYTE *)mbi.BaseAddress + mbi.RegionSize - (BYTE *)(ULONG_PTR)c->Esp);
+            if (n > sizeof(s_stack)) n = sizeof(s_stack);
+            CopyMemory(&s_stack, (void *)(ULONG_PTR)c->Esp, n & ~3u);
+        }
+    }
+    ResumeThread(th);
+    return TRUE;
+}
+static void sample_tick(DWORD now)
+{
+    static DWORD last_report;
+    CONTEXT c; int i;
+    if (!last_report)
+    {
+        static const char *const pre[] = { "kernelbase.dll", "kernel32.dll", "wined3d.dll", "opengl32.dll", "win32u.dll", "user32.dll", "gdi32.dll", "msvcr71.dll", "ucrtbase.dll", "winemac.drv", "d3dx9_27.dll", "mss32.dll" };
+        int k; HMODULE m;
+        for (k = 0; k < (int)(sizeof(pre) / sizeof(pre[0])); k++) if ((m = GetModuleHandleA(pre[k]))) smod_find((DWORD)(ULONG_PTR)m + 0x1000, TRUE);
+        if ((m = GetModuleHandleA("d3d9.dll"))) smod_find((DWORD)(ULONG_PTR)g_real + 0x1000, TRUE);
+        last_report = now; pick_side_threads();
+    }
+    if (sample_thread(g_main_thread, &c)) sample_add(&s_main, &c);
+    for (i = 0; i < s_nside; i++) if (sample_thread(s_side[i], &c))
+    {
+        int m = smod_find(c.Eip, FALSE);
+        sample_add(&s_side_s, &c);
+        if (m >= 0 && !lstrcmpiA(smod[m].name, "ntdll.dll")) { s_side_eip = c.Eip; CopyMemory(s_side_stack, s_stack.esp, sizeof(s_side_stack)); }
+    }
+    if (now - last_report >= 10000)
+    {
+        char who[200];
+        sampler_report(&s_main, "the game's thread");
+        wsprintfA(who, "the Direct3D helper thread%s (%d started in %s)", s_nside == 1 ? "" : "s", s_nside, s_nside ? s_side_mod : "-");
+        sampler_report(&s_side_s, who);
+        if (s_side_eip)
+        {
+            char line[1000], nm[120]; int len = 0, k, n = 0;
+            s_name(s_side_eip, nm); len += wsprintfA(line, "%s <-", nm);
+            for (k = 0; k < 0x60 && n < 9 && len < 880; k++)
+                if (s_side_stack[k] >= 0x10000 && smod_find(s_side_stack[k], TRUE) >= 0) { s_name(s_side_stack[k], nm); len += wsprintfA(line + len, " %s", nm); n++; }
+            logf("    the helper thread's last wait, with the code addresses on its stack: %s", line);
+            s_side_eip = 0;
+        }
+        pick_side_threads();
+        last_report = now;
+    }
+}
+
+static BOOL wd_sample(CONTEXT *c, DWORD *rets, int max, int *n)
+{
+    DWORD i;
+    ZeroMemory(c, sizeof(*c)); c->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER; *n = 0;
+    if (SuspendThread(g_main_thread) == (DWORD)-1) return FALSE;
+    if (!GetThreadContext(g_main_thread, c)) { ResumeThread(g_main_thread); return FALSE; }
+    if (!IsBadReadPtr((void *)(ULONG_PTR)c->Esp, 0x800))
+        for (i = 0; i < 0x200 && *n < max; i++)
+        {
+            DWORD v = ((DWORD *)(ULONG_PTR)c->Esp)[i];
+            if (v >= 0x401000 && v < 0xbd0000) rets[(*n)++] = v;      /* looks like a return address into game.dat */
+        }
+    ResumeThread(g_main_thread);
+    return TRUE;
+}
+static DWORD WINAPI wd_thread(void *arg)
+{
+    DWORD last = 0, last_change = GetTickCount(), said = 0, stall_lines = 0, last_line = 0, next_long = 4000;
+    DWORD eips[8], rets[14], tick = 0; int ne = 0, nr = 0;
+    for (;;)
+    {
+        DWORD now, still;
+        Sleep(cfg_sample ? 4 : 20);
+        if (!g_main_thread || !g_wd_frames) continue;
+        now = GetTickCount();
+        if (cfg_sample)
+        {
+            sample_tick(now);
+            if (++tick % 5) continue;                 /* the stall and freeze checks below every 20 ms as before */
+        }
+        if (g_wd_frames != last)
+        {
+            still = now - last_change;
+            if (said) logf("watchdog: frames again after %u ms", still);
+            else if (ne && still >= 100 && stall_lines < 300 && now - last_line > 2000)
+            {
+                /* a frame that took long: where the game's thread was, sampled every 20 ms from 60 ms on */
+                char line[700], where[400]; int len = 0, i;
+                for (i = 0; i < ne; i++) len += wsprintfA(line + len, " %x", eips[i]);
+                len += wsprintfA(line + len, " | return addresses at the last sample:");
+                for (i = 0; i < nr; i++) len += wsprintfA(line + len, " %x", rets[i]);
+                wd_describe(eips[ne - 1], where);
+                logf("  stall %u ms: the game's thread was at%s | last = %s", still, line, where);
+                stall_lines++; last_line = now;
+            }
+            last = g_wd_frames; last_change = now; said = 0; ne = 0; next_long = 4000;
+            continue;
+        }
+        still = now - last_change;
+        if (still >= 60 && ne < 8)
+        {
+            CONTEXT c;
+            if (wd_sample(&c, rets, 14, &nr)) eips[ne++] = c.Eip;
+        }
+        if (still >= next_long && said < 60)
+        {
+            CONTEXT c; char where[400], line[400]; int len = 0, i;
+            void **eng = (void **)0xde4324;
+            next_long = still + 10000;
+            logf("watchdog: no frame for %u s (now asking the game's thread where it is; if nothing follows, it could not be stopped)", still / 1000);
+            if (!wd_sample(&c, rets, 14, &nr)) { logf("watchdog: no frame for %u s; could not read the game's thread (err %u)", still / 1000, GetLastError()); said++; continue; }
+            line[0] = 0;
+            for (i = 0; i < nr; i++) len += wsprintfA(line + len, " %x", rets[i]);
+            wd_describe(c.Eip, where);
+            logf("watchdog: no frame for %u s. The game's thread is at eip=%08x (%s) esp=%08x ebp=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x esi=%08x edi=%08x",
+                 still / 1000, c.Eip, where, c.Esp, c.Ebp, c.Eax, c.Ecx, c.Edx, c.Ebx, c.Esi, c.Edi);
+            logf("  stack, values inside game.dat's code:%s", line);
+            if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40))
+                logf("  engine: phase %u of %u", *(DWORD *)((BYTE *)*eng + 0x34), *(DWORD *)((BYTE *)*eng + 0x38));
+            said++;
+        }
+    }
+    return 0;
+}
+static void wd_start(void)
+{
+    static BOOL once;
+    if (once) return;
+    once = TRUE;
+    g_main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+    if (!g_main_thread || !CreateThread(NULL, 0, wd_thread, NULL, 0, NULL)) logf("watchdog: not started (err %u)", GetLastError());
+}
+
+/* ---- profile=1: how much of the game thread's time goes into each Direct3D call ----
+ * Every method of the device gets a small thunk (push slot / jmp common) that reads the time-stamp counter before and
+ * after the real method; buffer and texture locks are timed in their own hooks. Times are exclusive (a call made from
+ * inside another is not counted twice). Only the thread that created the device is measured; other threads go
+ * straight through. A report per 10 s window goes to the log. Off unless asked for: the thunks cost frame rate. */
+static int cfg_profile;
+static int cfg_windowed;             /* windowed=1: the real device is a window that covers the screen (never a full-screen device) */
+#define PROF_DEV 119                 /* IDirect3DDevice9 methods */
+enum { PROF_VBLOCK = PROF_DEV, PROF_VBUNLOCK, PROF_IBLOCK, PROF_IBUNLOCK, PROF_TEXLOCK, PROF_TEXUNLOCK, PROF_VBFILL, PROF_IBFILL, PROF_N };
+static const char *const prof_names[PROF_N] = {
+    "QueryInterface", "AddRef", "Release", "TestCooperativeLevel", "GetAvailableTextureMem", "EvictManagedResources", "GetDirect3D", "GetDeviceCaps",
+    "GetDisplayMode", "GetCreationParameters", "SetCursorProperties", "SetCursorPosition", "ShowCursor", "CreateAdditionalSwapChain", "GetSwapChain",
+    "GetNumberOfSwapChains", "Reset", "Present", "GetBackBuffer", "GetRasterStatus", "SetDialogBoxMode", "SetGammaRamp", "GetGammaRamp", "CreateTexture",
+    "CreateVolumeTexture", "CreateCubeTexture", "CreateVertexBuffer", "CreateIndexBuffer", "CreateRenderTarget", "CreateDepthStencilSurface",
+    "UpdateSurface", "UpdateTexture", "GetRenderTargetData", "GetFrontBufferData", "StretchRect", "ColorFill", "CreateOffscreenPlainSurface",
+    "SetRenderTarget", "GetRenderTarget", "SetDepthStencilSurface", "GetDepthStencilSurface", "BeginScene", "EndScene", "Clear", "SetTransform",
+    "GetTransform", "MultiplyTransform", "SetViewport", "GetViewport", "SetMaterial", "GetMaterial", "SetLight", "GetLight", "LightEnable",
+    "GetLightEnable", "SetClipPlane", "GetClipPlane", "SetRenderState", "GetRenderState", "CreateStateBlock", "BeginStateBlock", "EndStateBlock",
+    "SetClipStatus", "GetClipStatus", "GetTexture", "SetTexture", "GetTextureStageState", "SetTextureStageState", "GetSamplerState", "SetSamplerState",
+    "ValidateDevice", "SetPaletteEntries", "GetPaletteEntries", "SetCurrentTexturePalette", "GetCurrentTexturePalette", "SetScissorRect",
+    "GetScissorRect", "SetSoftwareVertexProcessing", "GetSoftwareVertexProcessing", "SetNPatchMode", "GetNPatchMode", "DrawPrimitive",
+    "DrawIndexedPrimitive", "DrawPrimitiveUP", "DrawIndexedPrimitiveUP", "ProcessVertices", "CreateVertexDeclaration", "SetVertexDeclaration",
+    "GetVertexDeclaration", "SetFVF", "GetFVF", "CreateVertexShader", "SetVertexShader", "GetVertexShader", "SetVertexShaderConstantF",
+    "GetVertexShaderConstantF", "SetVertexShaderConstantI", "GetVertexShaderConstantI", "SetVertexShaderConstantB", "GetVertexShaderConstantB",
+    "SetStreamSource", "GetStreamSource", "SetStreamSourceFreq", "GetStreamSourceFreq", "SetIndices", "GetIndices", "CreatePixelShader",
+    "SetPixelShader", "GetPixelShader", "SetPixelShaderConstantF", "GetPixelShaderConstantF", "SetPixelShaderConstantI", "GetPixelShaderConstantI",
+    "SetPixelShaderConstantB", "GetPixelShaderConstantB", "DrawRectPatch", "DrawTriPatch", "DeletePatch", "CreateQuery",
+    "VertexBuffer::Lock", "VertexBuffer::Unlock", "IndexBuffer::Lock", "IndexBuffer::Unlock", "Texture::LockRect", "Texture::UnlockRect",
+    "(game writing vertices)", "(game writing indices)" };
+__attribute__((used)) static void *prof_orig[PROF_DEV];
+__attribute__((used)) static DWORD prof_tid;
+static struct { unsigned long long ticks; DWORD calls; } prof_acc[PROF_N];
+static struct { void *ret; DWORD slot; unsigned long long t0, child; } prof_stack[64];
+static int prof_sp, prof_fill_depth;
+static unsigned long long prof_top_ticks, prof_fill_t0, prof_fill_top0;    /* prof_top_ticks: all time inside measured calls so far */
+static DWORD prof_overhead_ticks, prof_thunked;                             /* per thunked call (measured once); thunked calls so far */
+static DWORD g_tsc_per_us_x16;                                              /* time-stamp counter ticks per microsecond, x16 */
+static inline unsigned long long tsc(void) { return __builtin_ia32_rdtsc(); }
+static inline DWORD cur_tid(void) { DWORD t; __asm__("movl %%fs:0x24, %0" : "=r"(t)); return t; }
+static DWORD ticks_us(unsigned long long ticks) { return g_tsc_per_us_x16 ? (DWORD)(ticks * 16 / g_tsc_per_us_x16) : 0; }
+
+__attribute__((used)) static void * __cdecl prof_enter(DWORD slot, void *ret)
+{
+    int i = prof_sp++;
+    prof_stack[i & 63].ret = ret; prof_stack[i & 63].slot = slot; prof_stack[i & 63].child = 0; prof_thunked++;
+    prof_stack[i & 63].t0 = tsc();
+    return prof_orig[slot];
+}
+__attribute__((used)) static void * __cdecl prof_leave(void)
+{
+    unsigned long long dt = tsc();
+    int i = --prof_sp & 63;
+    dt -= prof_stack[i].t0;
+    prof_acc[prof_stack[i].slot].ticks += dt - prof_stack[i].child;
+    prof_acc[prof_stack[i].slot].calls++;
+    if (prof_sp > 0) prof_stack[(prof_sp - 1) & 63].child += dt; else prof_top_ticks += dt;
+    return prof_stack[i].ret;
+}
+/* timed sections inside this file's own hooks (same accounting as the thunks) */
+static void prof_begin(DWORD slot)
+{
+    if (cfg_profile && cur_tid() == prof_tid)
+    { int i = prof_sp++ & 63; prof_stack[i].ret = 0; prof_stack[i].slot = slot; prof_stack[i].child = 0; prof_stack[i].t0 = tsc(); }
+}
+static void prof_end(void) { if (cfg_profile && cur_tid() == prof_tid) prof_leave(); }
+/* the stretch between a buffer's Lock returning and its Unlock: the game writing vertices (less any calls in between) */
+static void prof_fill_begin(void)
+{
+    if (cfg_profile && cur_tid() == prof_tid && prof_fill_depth++ == 0) { prof_fill_top0 = prof_top_ticks; prof_fill_t0 = tsc(); }
+}
+static void prof_fill_end(DWORD slot)
+{
+    if (cfg_profile && cur_tid() == prof_tid && prof_fill_depth > 0 && --prof_fill_depth == 0)
+    { prof_acc[slot].ticks += (tsc() - prof_fill_t0) - (prof_top_ticks - prof_fill_top0); prof_acc[slot].calls++; }
+}
+__attribute__((naked, used)) static void prof_common(void)
+{
+    __asm__(
+        "movl %fs:0x24, %eax\n"
+        "cmpl _prof_tid, %eax\n"
+        "jne 1f\n"
+        "popl %ecx\n"                       /* slot */
+        "popl %edx\n"                       /* the caller's return address */
+        "pushl %edx\n"
+        "pushl %ecx\n"
+        "call _prof_enter\n"                /* -> the real method */
+        "addl $8, %esp\n"
+        "pushl $2f\n"
+        "jmp *%eax\n"
+        "1: popl %ecx\n"                    /* another thread: straight through */
+        "movl _prof_orig(,%ecx,4), %eax\n"
+        "jmp *%eax\n"
+        "2: pushl %eax\n"                   /* the method's result */
+        "call _prof_leave\n"                /* -> the caller's return address */
+        "movl %eax, %edx\n"
+        "popl %eax\n"
+        "jmp *%edx\n");
+}
+static HRESULT WINAPI prof_dummy(void *p) { return (HRESULT)(ULONG_PTR)p; }
+static void prof_install(void **vt)
+{
+    static BYTE *code;
+    HRESULT (WINAPI *volatile f)(void *);
+    unsigned long long a, b, c;
+    LARGE_INTEGER q;
+    int i;
+    if (code || !cfg_profile) return;
+    code = VirtualAlloc(NULL, PROF_DEV * 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!code) return;
+    prof_tid = GetCurrentThreadId();
+    for (i = 0; i < PROF_DEV; i++)
+    {
+        BYTE *p = code + i * 16;
+        p[0] = 0x68; *(DWORD *)(p + 1) = i;                                          /* push slot */
+        p[5] = 0xE9; *(DWORD *)(p + 6) = (DWORD)((BYTE *)prof_common - (p + 10));    /* jmp prof_common */
+        prof_orig[i] = i < 3 ? (void *)prof_dummy : vt[i];
+    }
+    FlushInstructionCache(GetCurrentProcess(), code, PROF_DEV * 16);
+    /* what one thunked call costs, and what QueryPerformanceCounter costs, in time-stamp ticks */
+    f = prof_dummy; a = tsc(); for (i = 0; i < 20000; i++) f(0);
+    f = (void *)code; b = tsc(); for (i = 0; i < 20000; i++) f(0);
+    c = tsc(); for (i = 0; i < 2000; i++) QueryPerformanceCounter(&q);
+    prof_overhead_ticks = (DWORD)(((c - b) - (b - a)) / 20000);
+    logf("profile: on. One thunked call costs %u time-stamp ticks more than a plain one (plain %u); QueryPerformanceCounter costs %u ticks",
+         prof_overhead_ticks, (DWORD)((b - a) / 20000), (DWORD)((tsc() - c) / 2000));
+    ZeroMemory(prof_acc, sizeof(prof_acc)); prof_top_ticks = 0; prof_thunked = 0;
+    for (i = 3; i < PROF_DEV; i++) patch_slot(&vt[i], code + i * 16, NULL);
+}
+/* per 10 s window: calibrate the time-stamp counter against the clock; with profile=1 write the report */
+static void prof_window(DWORD frames)
+{
+    static unsigned long long last_tsc; static LARGE_INTEGER last_q;
+    unsigned long long now = tsc(), d3d = 0, fill, over;
+    LARGE_INTEGER q, fq;
+    DWORD us, order[PROF_N], n = 0, i, j, calls = 0;
+    char line[1000]; int len = 0;
+    QueryPerformanceCounter(&q); QueryPerformanceFrequency(&fq);
+    us = last_q.QuadPart ? (DWORD)((q.QuadPart - last_q.QuadPart) * 1000000 / fq.QuadPart) : 0;
+    if (us > 1000000) g_tsc_per_us_x16 = (DWORD)((now - last_tsc) * 16 / us);
+    last_tsc = now; last_q = q;
+    if (!cfg_profile || !frames || !g_tsc_per_us_x16 || !prof_tid) { ZeroMemory(prof_acc, sizeof(prof_acc)); prof_thunked = 0; return; }
+    for (i = 0; i < PROF_N; i++) if (prof_acc[i].calls) { order[n++] = i; if (i < PROF_VBFILL) { d3d += prof_acc[i].ticks; calls += prof_acc[i].calls; } }
+    for (i = 1; i < n; i++) for (j = i; j > 0 && prof_acc[order[j]].ticks > prof_acc[order[j - 1]].ticks; j--) { DWORD x = order[j]; order[j] = order[j - 1]; order[j - 1] = x; }
+    fill = prof_acc[PROF_VBFILL].ticks + prof_acc[PROF_IBFILL].ticks;
+    over = (unsigned long long)prof_thunked * prof_overhead_ticks;
+    logf("  profile: frame %u us = Direct3D calls %u us (%u calls a frame) + game writing vertices/indices %u us + measuring %u us + everything else (game code) %u us",
+         us / frames, ticks_us(d3d) / frames, calls / frames, ticks_us(fill) / frames, ticks_us(over) / frames,
+         us / frames - ticks_us(d3d + fill + over) / frames);
+    for (i = 0; i < n && i < 18; i++)
+    {
+        len += wsprintfA(line + len, "%s%s %u us (%u x)", i ? ", " : "", prof_names[order[i]], ticks_us(prof_acc[order[i]].ticks) / frames, prof_acc[order[i]].calls / frames);
+        if (len > 850) break;
+    }
+    logf("    per frame: %s", line);
+    for (len = 0, i = 18; i < n; i++)          /* the rest: how often per frame (x100 when rarer than once a frame) */
+    {
+        DWORD c100 = (DWORD)((unsigned long long)prof_acc[order[i]].calls * 100 / frames);
+        if (c100 >= 100) len += wsprintfA(line + len, "%s%s x%u", len ? ", " : "", prof_names[order[i]], c100 / 100);
+        else len += wsprintfA(line + len, "%s%s x0.%02u", len ? ", " : "", prof_names[order[i]], c100);
+        if (len > 900) break;
+    }
+    if (len) logf("    also called: %s", line);
+    ZeroMemory(prof_acc, sizeof(prof_acc)); prof_thunked = 0;
+}
+
+/* ---- spinwait=<microseconds>: the Direct3D layer's two threads hand work to each other without going to sleep ----
+ * Wine's Direct3D runs the real drawing on a second thread. For a 32-bit game every vertex-buffer Lock and Unlock is
+ * sent to that thread and waited for, well over a thousand times a frame in a battle. The helper thread goes to
+ * sleep as soon as it has nothing queued, and waking it costs tens of microseconds each time: the game's thread
+ * spent half its time waiting for that. With spinwait the helper thread stays awake (spinning) for up to that many
+ * microseconds before it really sleeps, and the game's thread waits by spinning instead of by yield system calls. */
+static int cfg_spinwait;
+static BOOL (WINAPI *o_w3d_SleepCV)(CONDITION_VARIABLE *, CRITICAL_SECTION *, DWORD);
+static LONG (WINAPI *o_w3d_Delay)(BOOLEAN, const LARGE_INTEGER *);
+static DWORD g_spin_cv, g_spin_cv_slept, g_spin_delay, g_main_tid;
+static BOOL WINAPI h_w3d_SleepCV(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms)
+{
+    static DWORD tid; static unsigned long long period_start, last_ret;
+    unsigned long long now, budget = (unsigned long long)g_tsc_per_us_x16 * cfg_spinwait / 16, gap = (unsigned long long)g_tsc_per_us_x16 * 4 / 16;
+    BOOL r;
+    if (!budget || ms != INFINITE || (tid && tid != cur_tid())) return o_w3d_SleepCV(cv, cs, ms);
+    tid = cur_tid();
+    now = tsc();
+    if (now - last_ret > gap) period_start = now;            /* not called again right after an early return: a new idle period */
+    if (now - period_start < budget)
+    {
+        int i;
+        LeaveCriticalSection(cs);
+        for (i = 0; i < 24; i++) YieldProcessor();
+        EnterCriticalSection(cs);
+        g_spin_cv++;
+        last_ret = tsc();
+        return TRUE;                                         /* an early wake-up: the caller looks at its queues again */
+    }
+    g_spin_cv_slept++;
+    r = o_w3d_SleepCV(cv, cs, ms);
+    last_ret = 0;
+    return r;
+}
+static LONG WINAPI h_w3d_Delay(BOOLEAN alertable, const LARGE_INTEGER *timeout)
+{
+    static unsigned long long start, last;
+    if (cfg_spinwait && !alertable && timeout && !timeout->QuadPart && g_tsc_per_us_x16 && cur_tid() == g_main_tid)
+    {
+        unsigned long long now = tsc();
+        if (now - last > (unsigned long long)g_tsc_per_us_x16 * 4 / 16) start = now;
+        if (now - start < (unsigned long long)g_tsc_per_us_x16 * 2000 / 16)      /* up to 2 ms of spinning, then real yields */
+        {
+            int i;
+            for (i = 0; i < 8; i++) YieldProcessor();
+            g_spin_delay++;
+            last = tsc();
+            return 0;
+        }
+        last = now;
+    }
+    return o_w3d_Delay(alertable, timeout);
+}
+static void spin_install(void)
+{
+    static BOOL once;
+    HMODULE w = GetModuleHandleA("wined3d.dll");
+    if (once || !cfg_spinwait || !w) return;
+    once = TRUE;
+    g_main_tid = GetCurrentThreadId();
+    o_w3d_SleepCV = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SleepConditionVariableCS");
+    o_w3d_Delay = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution");
+    if (o_w3d_SleepCV) iat_hook(w, "kernel32.dll", "SleepConditionVariableCS", h_w3d_SleepCV);
+    if (o_w3d_Delay) iat_hook(w, "ntdll.dll", "NtDelayExecution", h_w3d_Delay);
+    logf("spinwait: the Direct3D helper thread stays awake up to %d us before sleeping", cfg_spinwait);
+}
+
+/* ---- noglcheck=1: Wine's Direct3D stops asking OpenGL for an error code after every call ----
+ * wined3d wraps each OpenGL call in checkGLcall(), which calls glGetError() whenever error messages of its "d3d"
+ * debug channel are on (they are by default) and the driver has no debug-output extension (macOS has none). Under
+ * the emulator every OpenGL call is a costly crossing, and this doubles their number. The check only ever prints a
+ * message. Clearing the channel's flags in wined3d's memory turns it off (the same as WINEDEBUG=-d3d, which this
+ * runner does not start with). */
+static int cfg_noglcheck;
+static void noglcheck_install(void)
+{
+    static BOOL once;
+    BYTE *base = (BYTE *)GetModuleHandleA("wined3d.dll");
+    IMAGE_NT_HEADERS *nt; IMAGE_SECTION_HEADER *sec; int i, n = 0;
+    if (once || !cfg_noglcheck || !base) return;
+    once = TRUE;
+    nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    sec = IMAGE_FIRST_SECTION(nt);
+    for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+    {
+        BYTE *p, *end;
+        if (memcmp(sec->Name, ".data", 6)) continue;
+        p = base + sec->VirtualAddress; end = p + sec->Misc.VirtualSize - 16;
+        for (; p < end; p += 8)                 /* struct __wine_debug_channel { unsigned char flags; char name[15]; } */
+        {
+            static const BYTE name[15] = "d3d";
+            if (memcmp(p + 1, name, 15) || (p[0] != 0xff && p[0] > 0x0f)) continue;
+            p[0] = 0; n++;
+        }
+    }
+    logf("noglcheck: per-call OpenGL error checks of the Direct3D layer switched off (%d debug-channel entries)", n);
+}
+
+/* ---- heapkeep=1: the game's heap area stays accessible (cure for the total freeze) ----
+ * The game's memory manager reserves large address ranges (VirtualAlloc MEM_RESERVE), commits them in steps as it
+ * grows and decommits them again when it shrinks. Now and then game code writes through a pointer into a part of
+ * such a range that is not committed (any more). On Windows that is an access violation. Under the FEX emulator it
+ * never arrives: for a program without data-execution protection, like this one, FEX takes every write fault in
+ * readable-writable memory for its own write protection of translated code, "repairs" the page protection without
+ * looking at the result and runs the instruction again - for ever (the frozen game: one thread at 54,000 faults a
+ * second on the same address). With heapkeep the ranges are committed as soon as they are reserved, and a decommit
+ * throws the contents away but leaves the pages accessible, so such a write lands in memory nobody uses. Untouched
+ * committed pages cost no real memory. */
+static int cfg_heapkeep = 1;
+static DWORD g_heap_reserved_kb, g_heap_decommits;
+static LPVOID WINAPI h_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot)
+{
+    if (cfg_heapkeep && (type & MEM_RESERVE) && !(type & MEM_COMMIT) && prot == PAGE_READWRITE)
+    {
+        LPVOID p = VirtualAlloc(addr, size, type | MEM_COMMIT, prot);
+        if (p) { g_heap_reserved_kb += (DWORD)(size >> 10); return p; }
+    }
+    return VirtualAlloc(addr, size, type, prot);
+}
+/* ranges the game reserved before this DLL was loaded: commit what is still only reserved (large private
+ * read-write reservations only: not thread stacks, not the small reserves of the system heaps) */
+static void heapkeep_scan(void)
+{
+    static BOOL once;
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = (BYTE *)0x10000;
+    DWORD kb = 0, n = 0;
+    if (once || !cfg_heapkeep) return;
+    once = TRUE;
+    while ((ULONG_PTR)p < 0x7ffe0000 && VirtualQuery(p, &mbi, sizeof(mbi)))
+    {
+        if (mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE && mbi.AllocationProtect == PAGE_READWRITE && mbi.RegionSize >= 0x800000
+            && VirtualAlloc(mbi.BaseAddress, mbi.RegionSize, MEM_COMMIT, PAGE_READWRITE))
+        { kb += (DWORD)(mbi.RegionSize >> 10); n++; }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    g_heap_reserved_kb += kb;
+    logf("heapkeep: %u reserved range(s) from before, %u MB, committed", n, kb >> 10);
+}
+static BOOL WINAPI h_VirtualFree(LPVOID addr, SIZE_T size, DWORD type)
+{
+    if (cfg_heapkeep && type == MEM_DECOMMIT && addr && size)
+    {
+        BOOL r = VirtualFree(addr, size, MEM_DECOMMIT);
+        if (r) { VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE); g_heap_decommits++; }
+        return r;
+    }
+    return VirtualFree(addr, size, type);
+}
+
+/* ---- cswait=1 (diagnostic): how the Direct3D layer's threads wait, by the function they wait in ---- */
+static int cfg_cswait;
+static struct { unsigned long long ticks[2]; DWORD calls[2], slow[2]; } g_csw[4];      /* [function][0 = game's thread, 1 = others] */
+static LONG (WINAPI *o_csw_NtWait)(HANDLE, BOOLEAN, const LARGE_INTEGER *);
+static DWORD (WINAPI *o_csw_Wait)(HANDLE, DWORD);
+static void (WINAPI *o_csw_Enter)(CRITICAL_SECTION *);
+static void csw_note(int f, unsigned long long t0)
+{
+    unsigned long long dt = tsc() - t0; int who = cur_tid() != g_main_tid;
+    g_csw[f].ticks[who] += dt; g_csw[f].calls[who]++;
+    if (g_tsc_per_us_x16 && dt > (unsigned long long)g_tsc_per_us_x16 * 20 / 16) g_csw[f].slow[who]++;      /* took more than 20 us */
+}
+static LONG WINAPI h_csw_NtWait(HANDLE h, BOOLEAN a, const LARGE_INTEGER *to) { unsigned long long t0 = tsc(); LONG r = o_csw_NtWait(h, a, to); csw_note(0, t0); return r; }
+static DWORD WINAPI h_csw_Wait(HANDLE h, DWORD ms) { unsigned long long t0 = tsc(); DWORD r = o_csw_Wait(h, ms); csw_note(1, t0); return r; }
+static void WINAPI h_csw_Enter(CRITICAL_SECTION *cs) { unsigned long long t0 = tsc(); o_csw_Enter(cs); csw_note(2, t0); }
+static BOOL (WINAPI *o_csw_SleepCV)(CONDITION_VARIABLE *, CRITICAL_SECTION *, DWORD);
+static DWORD g_csw_cv_ms;
+static BOOL WINAPI h_csw_SleepCV(CONDITION_VARIABLE *cv, CRITICAL_SECTION *cs, DWORD ms) { unsigned long long t0 = tsc(); BOOL r = o_csw_SleepCV(cv, cs, ms); g_csw_cv_ms = ms; csw_note(3, t0); return r; }
+static void cswait_install(void)
+{
+    static BOOL once;
+    HMODULE w = GetModuleHandleA("wined3d.dll");
+    if (once || !cfg_cswait || !w) return;
+    once = TRUE;
+    if (!g_main_tid) g_main_tid = GetCurrentThreadId();
+    o_csw_NtWait = (void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWaitForSingleObject");
+    o_csw_Wait = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "WaitForSingleObject");
+    o_csw_Enter = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "EnterCriticalSection");
+    iat_hook(w, "ntdll.dll", "NtWaitForSingleObject", h_csw_NtWait);
+    iat_hook(w, "kernel32.dll", "WaitForSingleObject", h_csw_Wait);
+    iat_hook(w, "kernel32.dll", "EnterCriticalSection", h_csw_Enter);
+    o_csw_SleepCV = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SleepConditionVariableCS");
+    if (!cfg_spinwait) iat_hook(w, "kernel32.dll", "SleepConditionVariableCS", h_csw_SleepCV);
+}
+static void cswait_report(DWORD frames)
+{
+    static const char *const nm[4] = { "NtWaitForSingleObject", "WaitForSingleObject", "EnterCriticalSection", "SleepConditionVariableCS" };
+    char line[600]; int len = 0, f, w;
+    if (!cfg_cswait || !frames) return;
+    for (f = 0; f < 4; f++) for (w = 0; w < 2; w++) if (g_csw[f].calls[w])
+        len += wsprintfA(line + len, " %s by %s: %u calls, %u us, %u over 20 us;", nm[f], w ? "the helper thread" : "the game's thread",
+                         g_csw[f].calls[w] / frames, ticks_us(g_csw[f].ticks[w]) / frames, g_csw[f].slow[w] / frames);
+    logf("  cswait, per frame inside wined3d:%s (last condition-variable timeout %u ms)", line, g_csw_cv_ms);
+    ZeroMemory(g_csw, sizeof(g_csw));
+}
+
 /* ---- where a frame's time goes (for the slow-frame lines in the log) ---- */
 static struct {
-    LARGE_INTEGER frame_start, scene_start, lock_ret;
-    DWORD scene_us, scenes, draws, vb_locks, vb_lock_call_us, vb_fill_us, vb_creates, tex_creates, first_scene_us;
+    LARGE_INTEGER frame_start, scene_start;
+    unsigned long long lock_ret_tsc;
+    DWORD scene_us, scenes, draws, vb_locks, vb_lock_ticks, vb_fill_ticks, vb_creates, tex_creates, first_scene_us;
     DWORD tex_create_us, tex_locks, tex_lock_call_us, tex_fill_us, tex_unlock_us;
     DWORD dx_filter, dx_filter_us, dx_loadmem, dx_loadmem_us, dx_loadsurf, dx_loadsurf_us, dx_filter_flags, dx_loadmem_fmt, dx_loadmem_filter;
     LARGE_INTEGER tex_lock_ret, tex_created;
@@ -790,27 +1460,68 @@ static HRESULT WINAPI lb_EndScene(IDirect3DDevice9 *dev)
     fr.scenes++;
     return hr;
 }
+static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window, for the fps line */
 static HRESULT WINAPI lb_DIP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
-{ fr.draws++; return o_DIP(dev, t, base, minv, nv, start, prims); }
+{ fr.draws++; g_win_draws++; return o_DIP(dev, t, base, minv, nv, start, prims); }
 static HRESULT WINAPI lb_DP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT start, UINT prims)
-{ fr.draws++; return o_DP(dev, t, start, prims); }
+{ fr.draws++; g_win_draws++; return o_DP(dev, t, start, prims); }
+/* The game locks a vertex buffer well over a thousand times a frame in a battle, so these two must stay cheap: the
+ * time-stamp counter, not QueryPerformanceCounter (a call into the emulated system DLLs each time). */
 static HRESULT WINAPI lb_VBLock(IDirect3DVertexBuffer9 *vb, UINT off, UINT size, void **data, DWORD flags)
 {
-    LARGE_INTEGER t;
+    unsigned long long t = tsc();
     HRESULT hr;
-    QueryPerformanceCounter(&t);
+    prof_begin(PROF_VBLOCK);
     hr = o_VBLock(vb, off, size, data, flags);
-    QueryPerformanceCounter(&fr.lock_ret);
-    fr.vb_lock_call_us += us_between(&t, &fr.lock_ret);
-    fr.vb_locks++;
+    prof_end();
+    fr.lock_ret_tsc = tsc();
+    fr.vb_lock_ticks += (DWORD)(fr.lock_ret_tsc - t);
+    fr.vb_locks++; g_win_vblocks++;
+    prof_fill_begin();
     return hr;
 }
 static HRESULT WINAPI lb_VBUnlock(IDirect3DVertexBuffer9 *vb)
 {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    if (fr.lock_ret.QuadPart) fr.vb_fill_us += us_between(&fr.lock_ret, &t);
-    return o_VBUnlock(vb);
+    HRESULT hr;
+    if (fr.lock_ret_tsc) fr.vb_fill_ticks += (DWORD)(tsc() - fr.lock_ret_tsc);
+    prof_fill_end(PROF_VBFILL);
+    prof_begin(PROF_VBUNLOCK);
+    hr = o_VBUnlock(vb);
+    prof_end();
+    return hr;
+}
+static HRESULT (WINAPI *o_IBLock)(IDirect3DIndexBuffer9 *, UINT, UINT, void **, DWORD);
+static HRESULT (WINAPI *o_IBUnlock)(IDirect3DIndexBuffer9 *);
+static HRESULT (WINAPI *o_CreateIB)(IDirect3DDevice9 *, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DIndexBuffer9 **, HANDLE *);
+static HRESULT WINAPI lb_IBLock(IDirect3DIndexBuffer9 *ib, UINT off, UINT size, void **data, DWORD flags)
+{
+    HRESULT hr;
+    g_win_iblocks++;
+    prof_begin(PROF_IBLOCK);
+    hr = o_IBLock(ib, off, size, data, flags);
+    prof_end();
+    prof_fill_begin();
+    return hr;
+}
+static HRESULT WINAPI lb_IBUnlock(IDirect3DIndexBuffer9 *ib)
+{
+    HRESULT hr;
+    prof_fill_end(PROF_IBFILL);
+    prof_begin(PROF_IBUNLOCK);
+    hr = o_IBUnlock(ib);
+    prof_end();
+    return hr;
+}
+static HRESULT WINAPI lb_CreateIB(IDirect3DDevice9 *dev, UINT len, DWORD usage, D3DFORMAT f, D3DPOOL pool, IDirect3DIndexBuffer9 **out, HANDLE *h)
+{
+    HRESULT hr = o_CreateIB(dev, len, usage, f, pool, out, h);
+    if (SUCCEEDED(hr) && out && *out)
+    {
+        void **vt = *(void ***)*out;
+        patch_slot(&vt[11], lb_IBLock, (void **)&o_IBLock);
+        patch_slot(&vt[12], lb_IBUnlock, (void **)&o_IBUnlock);
+    }
+    return hr;
 }
 static HRESULT WINAPI lb_CreateVB(IDirect3DDevice9 *dev, UINT len, DWORD usage, DWORD fvf, D3DPOOL pool, IDirect3DVertexBuffer9 **out, HANDLE *h)
 {
@@ -1278,7 +1989,9 @@ static HRESULT WINAPI lb_TexLock(IDirect3DTexture9 *t, UINT level, D3DLOCKED_REC
     LARGE_INTEGER a;
     HRESULT hr;
     QueryPerformanceCounter(&a);
+    prof_begin(PROF_TEXLOCK);
     hr = o_TexLock(t, level, lr, rc, flags);
+    prof_end();
     QueryPerformanceCounter(&fr.tex_lock_ret);
     fr.tex_lock_call_us += us_between(&a, &fr.tex_lock_ret);
     fr.tex_locks++;
@@ -1290,7 +2003,9 @@ static HRESULT WINAPI lb_TexUnlock(IDirect3DTexture9 *t, UINT level)
     HRESULT hr;
     QueryPerformanceCounter(&a);
     if (fr.tex_lock_ret.QuadPart) fr.tex_fill_us += us_between(&fr.tex_lock_ret, &a);
+    prof_begin(PROF_TEXUNLOCK);
     hr = o_TexUnlock(t, level);
+    prof_end();
     QueryPerformanceCounter(&b);
     fr.tex_unlock_us += us_between(&a, &b);
     return hr;
@@ -1483,7 +2198,7 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
             logf("  slow frame %u ms (%u ms after the previous one): %u ms before the first scene, %u scene(s) %u ms, %u draws, "
                  "vb: %u locks (%u us in Lock, %u us filling), %u created, textures created %u",
                  us / 1000, last_slow.QuadPart ? us_between(&last_slow, &qpc) / 1000 : 0, fr.first_scene_us / 1000, fr.scenes,
-                 fr.scene_us / 1000, fr.draws, fr.vb_locks, fr.vb_lock_call_us, fr.vb_fill_us, fr.vb_creates, fr.tex_creates);
+                 fr.scene_us / 1000, fr.draws, fr.vb_locks, ticks_us(fr.vb_lock_ticks), ticks_us(fr.vb_fill_ticks), fr.vb_creates, fr.tex_creates);
             last_slow = qpc;
             if (fr.tex_creates)
             {
@@ -1519,6 +2234,7 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         void **eng = (void **)0xde4324;      /* frame boundary for the first-phase latch */
         frame_len_tick();
         g_frame_no++;
+        g_wd_frames++;
         if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40) && *(DWORD *)((BYTE *)*eng + 0x34) != 1) g_seen_other_phase = TRUE;
     }
     ZeroMemory(&fr, sizeof(fr));
@@ -1549,6 +2265,12 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         }
         if (g_fast_filters || g_slow_filters) { logf("  mip filters this window: %u fast, %u through d3dx", g_fast_filters, g_slow_filters); g_fast_filters = g_slow_filters = 0; }
         if (g_net_n) { logf("  network: ticks of the other side's data waiting: min %d, average %d.%d, max %d", g_net_min, (int)(g_net_sum / g_net_n), (int)(g_net_sum * 10 / g_net_n) % 10, g_net_max); g_net_n = 0; g_net_sum = 0; }
+        if (frames) logf("  per frame: %u draws, %u vertex-buffer locks, %u index-buffer locks", g_win_draws / frames, g_win_vblocks / frames, g_win_iblocks / frames);
+        g_win_draws = g_win_vblocks = g_win_iblocks = 0;
+        { static DWORD kb_said, dec_said; if (g_heap_reserved_kb != kb_said || g_heap_decommits != dec_said) { logf("  heapkeep: %u MB of the game's reserved heap ranges kept committed so far, %u decommits kept accessible", g_heap_reserved_kb >> 10, g_heap_decommits); kb_said = g_heap_reserved_kb; dec_said = g_heap_decommits; } }
+        cswait_report(frames);
+        prof_window(frames);
+        if (cfg_spinwait && frames) { logf("  spinwait: per frame the helper thread stayed awake %u times and went to sleep %u times; the game's thread spun %u times", g_spin_cv / frames, g_spin_cv_slept / frames, g_spin_delay / frames); g_spin_cv = g_spin_cv_slept = g_spin_delay = 0; }
         { static DWORD prio_said; if (g_prio_skipped != prio_said) { logf("  repeated SetThreadPriority calls answered locally: %u in this window", g_prio_skipped - prio_said); prio_said = g_prio_skipped; } }
         ZeroMemory(&st, sizeof(st));
         t0 = now; frames = 0; max_us = 0;
@@ -1605,6 +2327,22 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
     return hr;
 }
 
+/* windowed=1: instead of a full-screen device at the current mode, a borderless window that covers the screen. A
+ * Direct3D 9 library that would set a display mode for any full-screen device can then never touch the display. */
+static void go_windowed(const D3DPRESENT_PARAMETERS *pp, D3DPRESENT_PARAMETERS *real, HWND wnd)
+{
+    MONITORINFO mi;
+    if (!cfg_windowed || pp->Windowed || !wnd) return;
+    real->Windowed = TRUE;
+    real->FullScreen_RefreshRateInHz = 0;
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTOPRIMARY), &mi)) return;
+    SetWindowLongW(wnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    SetWindowPos(wnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    logf("windowed: the game's window covers %d,%d %dx%d", (int)mi.rcMonitor.left, (int)mi.rcMonitor.top,
+         (int)(mi.rcMonitor.right - mi.rcMonitor.left), (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+}
 static HRESULT WINAPI lb_Reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp)
 {
     D3DPRESENT_PARAMETERS real;
@@ -1613,6 +2351,7 @@ static HRESULT WINAPI lb_Reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp)
     drop_rt(dev);
     sync_release();
     lb = prepare(pp, &real);
+    go_windowed(pp, &real, g.hwnd);
     hr = o_Reset(dev, &real);
     logf("Reset: game %ux%u windowed=%d -> real %ux%u hr=%08x", pp->BackBufferWidth, pp->BackBufferHeight,
          pp->Windowed, real.BackBufferWidth, real.BackBufferHeight, hr);
@@ -1648,6 +2387,8 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
         HMODULE h = LoadLibraryA("lsteamclient.dll");
         logf("steam overlay: lsteamclient.dll %s (err %u)", h ? "loaded" : "NOT loaded", h ? 0 : GetLastError());
     }
+    go_windowed(pp, &real, wnd);
+    wd_start();
     hr = o_CreateDevice(d3d, adapter, type, focus, flags, &real, out);
     logf("CreateDevice: game %ux%u fmt=%d windowed=%d refresh=%u interval=%08x swap=%d -> real %ux%u refresh=0 interval=%08x hr=%08x",
          pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat, pp->Windowed, pp->FullScreen_RefreshRateInHz,
@@ -1657,6 +2398,11 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
     {
         void **vt = *(void ***)*out;
         pp->BackBufferCount = real.BackBufferCount;
+        prof_install(vt);
+        spin_install();
+        noglcheck_install();
+        cswait_install();
+        heapkeep_scan();
         patch_slot(&vt[14], lb_GetSwapChain, (void **)&o_GetSwapChain);
         patch_slot(&vt[16], lb_Reset, (void **)&o_Reset);
         patch_slot(&vt[17], lb_Present, (void **)&o_Present);
@@ -1665,6 +2411,7 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
         { static BOOL once; if (!once && cfg_jumpbudget) { once = TRUE; set_jump_budget(cfg_jumpbudget); } }
         patch_slot(&vt[23], lb_CreateTex, (void **)&o_CreateTex);
         patch_slot(&vt[26], lb_CreateVB, (void **)&o_CreateVB);
+        patch_slot(&vt[27], lb_CreateIB, (void **)&o_CreateIB);
         patch_slot(&vt[41], lb_BeginScene, (void **)&o_BeginScene);
         patch_slot(&vt[42], lb_EndScene, (void **)&o_EndScene);
         patch_slot(&vt[81], lb_DP, (void **)&o_DP);
@@ -1789,6 +2536,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_topinset = GetPrivateProfileIntW(L"letterbox", L"topinset", 0, ini);
             cfg_valign = (int)GetPrivateProfileIntW(L"letterbox", L"valign", 0, ini);
             cfg_showfps = (int)GetPrivateProfileIntW(L"letterbox", L"showfps", 0, ini);
+            cfg_profile = (int)GetPrivateProfileIntW(L"letterbox", L"profile", 0, ini);
+            cfg_sample = (int)GetPrivateProfileIntW(L"letterbox", L"sample", 0, ini);
+            cfg_spinwait = (int)GetPrivateProfileIntW(L"letterbox", L"spinwait", 0, ini);
+            cfg_noglcheck = (int)GetPrivateProfileIntW(L"letterbox", L"noglcheck", 0, ini);
+            cfg_heapkeep = (int)GetPrivateProfileIntW(L"letterbox", L"heapkeep", 1, ini);
+            cfg_cswait = (int)GetPrivateProfileIntW(L"letterbox", L"cswait", 0, ini);
             cfg_roundbuttons = (int)GetPrivateProfileIntW(L"letterbox", L"roundbuttons", 1, ini);
             cfg_gamefps = GetPrivateProfileIntW(L"letterbox", L"gamefps", 30, ini);
             cfg_gamew = GetPrivateProfileIntW(L"letterbox", L"gamew", 0, ini);
@@ -1804,12 +2557,23 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_refresh = GetPrivateProfileIntW(L"letterbox", L"refresh", 0, ini);
             cfg_syncsleep = GetPrivateProfileIntW(L"letterbox", L"syncsleep", 3000, ini);
             cfg_frameclock = (int)GetPrivateProfileIntW(L"letterbox", L"frameclock", 1, ini);
+            GetPrivateProfileStringW(L"letterbox", L"real", L"", cfg_real, 64, ini);
+            cfg_windowed = (int)GetPrivateProfileIntW(L"letterbox", L"windowed", 0, ini);
         }
         logf("letterbox d3d9 proxy loaded (vsync=%d fastfilter=%d jumpbudget=%d topinset=%u syncpresent=%d refresh=%u)",
              cfg_vsync, cfg_fastfilter, cfg_jumpbudget, cfg_topinset, cfg_sync, cfg_refresh);
-        GetSystemDirectoryW(path, MAX_PATH);       /* syswow64 for a 32-bit game */
-        lstrcatW(path, L"\\d3d9.dll");
-        g_real = LoadLibraryW(path);
+        if (cfg_real[0])
+        {
+            lstrcpyW(path, g_dir); lstrcatW(path, L"\\"); lstrcatW(path, cfg_real);
+            g_real = LoadLibraryW(path);
+            logf("real Direct3D 9 library: %ls %s (err %u)", cfg_real, g_real ? "loaded" : "NOT loaded, using the system's", g_real ? 0 : GetLastError());
+        }
+        if (!g_real)
+        {
+            GetSystemDirectoryW(path, MAX_PATH);       /* syswow64 for a 32-bit game */
+            lstrcatW(path, L"\\d3d9.dll");
+            g_real = LoadLibraryW(path);
+        }
         if (!g_real || g_real == (HMODULE)inst) { logf("could not load the real d3d9.dll (err %u)", GetLastError()); return TRUE; }
         real_Direct3DCreate9 = (void *)GetProcAddress(g_real, "Direct3DCreate9");
 #define RESOLVE(n) real_##n = (void *)GetProcAddress(g_real, #n);
@@ -1818,6 +2582,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
         iat_hook(exe, "user32.dll", "SetCursorPos", h_SetCursorPos);
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
         iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);
+        if (cfg_heapkeep) { iat_hook(exe, "kernel32.dll", "VirtualAlloc", h_VirtualAlloc); iat_hook(exe, "kernel32.dll", "VirtualFree", h_VirtualFree); }
         iat_hook(exe, "kernel32.dll", "Sleep", h_Sleep);                               /* wait recorder, see waits_report */
         iat_hook(exe, "kernel32.dll", "WaitForSingleObject", h_WaitForSingleObject);
         {

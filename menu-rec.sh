@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test aid: start the game, sit in the main menu and record N frames (brightness + frame time) to <game>/letterbox.rec
 . "$(dirname "$0")/env.sh"; need_steam
-pkill -f "game.dat"; pkill -f lotrbfme2
+pkill -x game.dat; pkill -f lotrbfme2
 for i in $(seq 1 20); do tail -1 "$CD/notproton-run.log" 2>/dev/null | grep -q "session ending" && break; sleep 1; done
 rm -f "${G:?}/letterbox.log" "${G:?}/letterbox.rec"
 open "$URL"
