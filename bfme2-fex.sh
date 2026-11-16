@@ -120,8 +120,10 @@ if [ -n "$RES" ] && [ ! -e "$T/widescreen-art/disabled" ]; then
     UV=$(command -v uv 2>/dev/null) || UV=""
     for c in "$HOME/.local/bin/uv" /opt/homebrew/bin/uv /usr/local/bin/uv; do [ -n "$UV" ] || { [ -x "$c" ] && UV="$c"; }; done
     if [ -n "$UV" ]; then
+      SHAPE="$rw/$rh"                               # a set borrowed from a nearby shape is built again for its own shape
+      [ "$KEY" = "$(shape_key "$rw" "$rh")" ] || SHAPE="${KEY#a}/1000"
       say "building the art set $KEY for ${rw}x${rh}${STALE:+ again (make-art.py has changed)}"
-      "$UV" run -q --with pillow python "$T/widescreen-art/make-art.py" "$GAME" "$ART" "$rw/$rh" >> "$LOG" 2>&1
+      "$UV" run -q --with pillow python "$T/widescreen-art/make-art.py" "$GAME" "$ART" "$SHAPE" >> "$LOG" 2>&1
     fi
     [ -z "$STALE" ] || touch "$ART/!widescreen-art.big"
   fi
