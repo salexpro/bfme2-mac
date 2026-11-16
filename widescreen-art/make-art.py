@@ -94,7 +94,11 @@ def hud_files(game, aspect):
 def dxt5(im):
     """one mip level as DXT5 blocks: end points = the block's extremes, each pixel the nearest step between them"""
     w, h = im.size; W = max(4, (w + 3) // 4 * 4); H = max(4, (h + 3) // 4 * 4)
-    if (W, H) != (w, h): im = im.resize((W, H), Image.NEAREST)
+    if (W, H) != (w, h):                 # a level smaller than a block: repeated to fill it, its own pixels stay top left
+        c = Image.new('RGBA', (W, H))
+        for oy in range(0, H, h):
+            for ox in range(0, W, w): c.paste(im, (ox, oy))
+        im = c
     raw = im.tobytes(); out = bytearray()
     for by in range(0, H, 4):
         rows = [raw[(by + j) * W * 4:(by + j + 1) * W * 4] for j in range(4)]

@@ -1647,7 +1647,8 @@ static DWORD g_win_draws, g_win_vblocks, g_win_iblocks;      /* per 10 s window,
  * projection, like all of the game's 2D drawing - gets its width multiplied by (4/3) / picture shape about the middle
  * of the screen, which is where the medallion is. ringround=0 switches it off. */
 static int cfg_ringround = 1;
-static DWORD g_ring_opened;                      /* tick count (never 0) when the game opened the ring video */
+static BOOL g_ring_armed;                        /* the game has opened the ring video and its texture is still to come */
+static DWORD g_ring_opened;                      /* tick count of that */
 static IDirect3DTexture9 *g_ring_tex;            /* the texture its frames go into */
 static DWORD g_ring_locked;                      /* number of the frame in which that texture was last written */
 static DWORD g_frame_no;
@@ -1656,9 +1657,18 @@ static HANDLE WINAPI h_CreateFileA(LPCSTR name, DWORD access, DWORD share, LPSEC
     if (name)
     {
         int n = lstrlenA(name);
-        if (n >= 15 && !lstrcmpiA(name + n - 15, "loadingring.vp6")) g_ring_opened = GetTickCount() | 1;
+        if (n >= 15 && !lstrcmpiA(name + n - 15, "loadingring.vp6")) { g_ring_opened = GetTickCount(); g_ring_armed = TRUE; }
     }
     return CreateFileA(name, access, share, sa, disp, flags, tmpl);
+}
+static HANDLE WINAPI h_CreateFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD flags, HANDLE tmpl)
+{
+    if (name)
+    {
+        int n = lstrlenW(name);
+        if (n >= 15 && !lstrcmpiW(name + n - 15, L"loadingring.vp6")) { g_ring_opened = GetTickCount(); g_ring_armed = TRUE; }
+    }
+    return CreateFileW(name, access, share, sa, disp, flags, tmpl);
 }
 static BOOL is_identity(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE which)
 {
@@ -1692,7 +1702,9 @@ static HRESULT ring_draw(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UI
 static HRESULT WINAPI lb_DIP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, INT base, UINT minv, UINT nv, UINT start, UINT prims)
 {
     fr.draws++; g_win_draws++;
-    if (g_ring_tex && prims == 2 && nv == 4 && g_frame_no - g_ring_locked < 4) return ring_draw(dev, t, base, minv, nv, start, prims);
+    /* the video has 30 frames a second, so its texture is written only every few drawn frames; half a second without
+     * an update and the texture is taken to be out of use */
+    if (g_ring_tex && prims == 2 && nv == 4 && g_frame_no - g_ring_locked < 60) return ring_draw(dev, t, base, minv, nv, start, prims);
     return o_DIP(dev, t, base, minv, nv, start, prims);
 }
 static HRESULT WINAPI lb_DP(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE t, UINT start, UINT prims)
@@ -2498,9 +2510,10 @@ static HRESULT WINAPI lb_CreateTex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT l
         void **vt = *(void ***)*out;
         patch_slot(&vt[19], lb_TexLock, (void **)&o_TexLock);
         patch_slot(&vt[20], lb_TexUnlock, (void **)&o_TexUnlock);
-        if (cfg_ringround && w == 128 && h == 128 && g_ring_opened && GetTickCount() - g_ring_opened < 5000)
+        if (g_ring_armed && GetTickCount() - g_ring_opened >= 5000) g_ring_armed = FALSE;      /* no texture followed the open */
+        if (cfg_ringround && w == 128 && h == 128 && g_ring_armed)
         {
-            g_ring_tex = *out; g_ring_opened = 0; g_ring_locked = g_frame_no;
+            g_ring_tex = *out; g_ring_armed = FALSE; g_ring_locked = g_frame_no;
             logf("ring video: its frames go into texture %p (128x128, format %d, %u level(s))", (void *)*out, (int)f, lv);
         }
         else if (*out == g_ring_tex) g_ring_tex = NULL;      /* that address belongs to another texture now */
@@ -3071,7 +3084,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
         iat_hook(exe, "user32.dll", "ClipCursor", h_ClipCursor);
         iat_hook(exe, "kernel32.dll", "SetThreadPriority", h_SetThreadPriority);
         if (cfg_heapkeep) { iat_hook(exe, "kernel32.dll", "VirtualAlloc", h_VirtualAlloc); iat_hook(exe, "kernel32.dll", "VirtualFree", h_VirtualFree); }
-        if (cfg_ringround) iat_hook(exe, "kernel32.dll", "CreateFileA", h_CreateFileA);
+        if (cfg_ringround)       /* the game opens files itself and through its C runtime */
+        {
+            HMODULE crt = GetModuleHandleA("msvcr71.dll");
+            iat_hook(exe, "kernel32.dll", "CreateFileA", h_CreateFileA); iat_hook(exe, "kernel32.dll", "CreateFileW", h_CreateFileW);
+            if (crt) { iat_hook(crt, "kernel32.dll", "CreateFileA", h_CreateFileA); iat_hook(crt, "kernel32.dll", "CreateFileW", h_CreateFileW); }
+        }
         iat_hook(exe, "kernel32.dll", "Sleep", h_Sleep);                               /* wait recorder, see waits_report */
         iat_hook(exe, "kernel32.dll", "WaitForSingleObject", h_WaitForSingleObject);
         {
