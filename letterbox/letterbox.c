@@ -110,6 +110,54 @@ static BOOL after_call(DWORD a)            /* is the instruction before this add
     if (p[-2] == 0xFF && ((p[-1] & 0xF8) == 0xD0 || (p[-1] & 0xF8) == 0x10)) return TRUE;   /* call reg / call [reg] */
     return FALSE;
 }
+static BOOL mem_ok(DWORD a, DWORD bytes)   /* committed, readable, and the whole range inside one region */
+{
+    MEMORY_BASIC_INFORMATION mi;
+    if (a < 0x10000 || a + bytes < a || !VirtualQuery((const void *)(ULONG_PTR)a, &mi, sizeof(mi)) || mi.State != MEM_COMMIT ||
+        (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return FALSE;
+    return a + bytes <= (DWORD)(ULONG_PTR)mi.BaseAddress + mi.RegionSize;
+}
+static int g_names_left;
+static void note_text(DWORD a, const char *how)     /* a run of at least 5 printable characters within 48 bytes of a */
+{
+    const BYTE *p = (const BYTE *)(ULONG_PTR)a;
+    char s[52];
+    int i, start = -1, best = 0, best_at = 0;
+    if (g_names_left <= 0 || !mem_ok(a, 48)) return;
+    for (i = 0; i <= 48; i++)
+    {
+        BOOL pr = i < 48 && p[i] >= 0x20 && p[i] < 0x7f;
+        if (pr && start < 0) start = i;
+        if (!pr && start >= 0) { if (i - start > best) { best = i - start; best_at = start; } start = -1; }
+    }
+    if (best < 5) return;
+    memcpy(s, p + best_at, best); s[best] = 0;
+    g_names_left--;
+    logf("    %s -> \"%s\"", how, s);
+}
+static void note_names(DWORD obj)         /* text within three pointer steps of an object: what kind of thing it is */
+{
+    char how[64];
+    DWORD i, j, k, a, b2, c2;
+    if (!mem_ok(obj, 64 * 4)) return;
+    for (i = 0; i < 64 && g_names_left > 0; i++)
+    {
+        a = ((const DWORD *)(ULONG_PTR)obj)[i];
+        if (!mem_ok(a, 24 * 4)) continue;
+        wsprintfA(how, "+%x", i * 4); note_text(a, how);
+        for (j = 0; j < 24 && g_names_left > 0; j++)
+        {
+            b2 = ((const DWORD *)(ULONG_PTR)a)[j];
+            if (!mem_ok(b2, 12 * 4)) continue;
+            wsprintfA(how, "+%x +%x", i * 4, j * 4); note_text(b2, how);
+            for (k = 0; k < 12 && g_names_left > 0; k++)
+            {
+                c2 = ((const DWORD *)(ULONG_PTR)b2)[k];
+                wsprintfA(how, "+%x +%x +%x", i * 4, j * 4, k * 4); note_text(c2, how);
+            }
+        }
+    }
+}
 static LONG CALLBACK crash_note(EXCEPTION_POINTERS *x)
 {
     static LONG said;
@@ -122,15 +170,15 @@ static LONG CALLBACK crash_note(EXCEPTION_POINTERS *x)
     DWORD i, n;
     int len;
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || c->Eip < g_code_lo || c->Eip >= g_code_hi) return EXCEPTION_CONTINUE_SEARCH;
-    if (InterlockedIncrement(&said) > 4) return EXCEPTION_CONTINUE_SEARCH;
-    ip = (const BYTE *)(ULONG_PTR)c->Eip;
+    if (InterlockedIncrement(&said) > 8) return EXCEPTION_CONTINUE_SEARCH;      /* the game may catch some itself */
+    ip = mem_ok(c->Eip, 8) ? (const BYTE *)(ULONG_PTR)c->Eip : (const BYTE *)"\0\0\0\0\0\0\0";
     logf("game fault: access violation at %08x %s address %08x, thread %u", c->Eip,
-         r->NumberParameters >= 2 && r->ExceptionInformation[0] ? "writing" : "reading",
+         r->NumberParameters < 2 || !r->ExceptionInformation[0] ? "reading" : r->ExceptionInformation[0] == 1 ? "writing" : "executing",
          r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0, GetCurrentThreadId());
     logf("  eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x ebp %08x esp %08x | code %02x %02x %02x %02x %02x %02x %02x %02x",
          c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7]);
     sp = (const DWORD *)(ULONG_PTR)c->Esp;
-    if (!VirtualQuery(sp, &mi, sizeof(mi)) || mi.State != MEM_COMMIT) return EXCEPTION_CONTINUE_SEARCH;
+    if (!mem_ok(c->Esp, 4) || !VirtualQuery(sp, &mi, sizeof(mi))) return EXCEPTION_CONTINUE_SEARCH;
     n = (DWORD)(((BYTE *)mi.BaseAddress + mi.RegionSize - (BYTE *)sp) / 4);
     if (n > 1024) n = 1024;
     for (len = wsprintfA(line, "  stack:"), i = 0; i < 24 && i < n; i++) len += wsprintfA(line + len, " %08x", sp[i]);
@@ -150,6 +198,26 @@ static LONG CALLBACK crash_note(EXCEPTION_POINTERS *x)
             if (n > 48) n = 48;
             for (len = wsprintfA(line, "  [%s]:", name[j]), i = 0; i < n; i++) len += wsprintfA(line + len, " %08x", p[i]);
             logf("%s", line);
+        }
+    }
+    /* 0xB6DD43: the collision manager's sweep found the end of an object's extent before its start (eax = the
+     * manager's record of the object: six sorted end points at +24h.., floats at +34h +48h (x), +5Ch +70h (y),
+     * +84h +98h (z); the game object that owns it at +A0h). Say which object that is. */
+    if (c->Eip == 0xb6dd43 && mem_ok(c->Eax, 0xa8))
+    {
+        DWORD own = *(const DWORD *)(ULONG_PTR)(c->Eax + 0xa0);
+        if (mem_ok(own, 64 * 4))
+        {
+            const DWORD *p = (const DWORD *)(ULONG_PTR)own;
+            int part;
+            for (part = 0; part < 2; part++)
+            {
+                for (len = wsprintfA(line, "  owner %08x +%02x:", own, part * 0x80), i = 0; i < 32; i++) len += wsprintfA(line + len, " %08x", p[part * 32 + i]);
+                logf("%s", line);
+            }
+            g_names_left = 60;
+            logf("  text near the owner (offsets of the pointers followed):");
+            note_names(own);
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -405,10 +473,11 @@ __attribute__((used)) static DWORD __stdcall lim_target(DWORD ms)
  * changes them. That was a real crash: the tint hook returned with a frame count in edx, the game wrote a colour
  * through it (access violation at 0x404A21, in both games of a network match at the same tick, 16 Nov 2026).
  * So every such hook is a small assembly routine, and the C part runs between HOOK_SAVE and HOOK_RESTORE, which
- * keep all general registers, the flags and the whole FPU/SSE state. After HOOK_SAVE ebp points at the saved
+ * keep all general registers, the flags and the whole FPU/SSE state (fninit gives the C part an empty FPU stack and
+ * default rounding, whatever the game had there; fxrstor puts the game's state back). After HOOK_SAVE ebp points at the saved
  * edi, esi, ebp, esp, ebx, edx, ecx, eax (+0 .. +28), the flags (+32), the return address (+36) and the stack
  * arguments (+40 ...). */
-#define HOOK_SAVE    "pushfl\n" "pushal\n" "movl %esp, %ebp\n" "subl $512, %esp\n" "andl $-16, %esp\n" "fxsave (%esp)\n"
+#define HOOK_SAVE    "pushfl\n" "pushal\n" "movl %esp, %ebp\n" "subl $512, %esp\n" "andl $-16, %esp\n" "fxsave (%esp)\n" "fninit\n"
 #define HOOK_RESTORE "fxrstor (%esp)\n" "movl %ebp, %esp\n" "popal\n" "popfl\n"
 
 __attribute__((naked)) static void h_LimTarget(void)       /* replaces: mov esi,eax / mov ecx,edi / sub ecx,[0xde4318] */
@@ -1925,6 +1994,8 @@ __attribute__((naked)) static void h_SetFrameLen(void)     /* stdcall (float ms)
             "pushl 40(%ebp)\n"
             "call _frame_len_set\n"
             "addl $4, %esp\n"
+            "cvttss2si 40(%ebp), %eax\n"    /* the game's setter leaves (int)ms in eax */
+            "movl %eax, 28(%ebp)\n"
             HOOK_RESTORE
             "ret $4\n");
 }
