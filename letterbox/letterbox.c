@@ -2205,17 +2205,115 @@ __attribute__((naked)) static void h_CollUpdate(void)      /* stands in the tabl
             HOOK_RESTORE
             "jmp *_p_coll_update\n");
 }
+/* The same thing at its source. Every game object has a function the game calls whenever the object's place or
+ * direction changes (0x69355d, entry +14h of the table at 0xc123d8; the object's matrix at +8 and its position at
+ * +38h are already the new ones, and the function gets the old matrix, the old position and the old angle). The
+ * game itself begins that function by destroying an object whose position is not a number. A position that is a
+ * number but billions of units away gets through, and then more than the collision manager chokes on it (with the
+ * unit only taken out of the collision manager the game froze three minutes later in another part of its logic).
+ * So the table entry is pointed here: when an object that was on the map is about to be outside +-100000, its
+ * matrix, position and angle are put back to the old ones before the game's function runs. The unit stays where
+ * it was; the log says what it is and which code asked for the move. The test is done in a few instructions
+ * without touching a register, because this is called for every unit that moves. */
+static DWORD g_far_kept;
+static void note_callers(const DWORD *sp)          /* the return addresses on the stack above sp, one log line */
+{
+    MEMORY_BASIC_INFORMATION mi;
+    char line[500];
+    DWORD i, n;
+    int len;
+    if (!mem_ok((DWORD)(ULONG_PTR)sp, 4) || !VirtualQuery(sp, &mi, sizeof(mi))) return;
+    n = (DWORD)(((BYTE *)mi.BaseAddress + mi.RegionSize - (BYTE *)sp) / 4);
+    if (n > 1024) n = 1024;
+    for (len = wsprintfA(line, "    asked for by (return addresses, offset from the stack top):"), i = 0; i < n && len < 460; i++)
+        if (after_call(sp[i])) len += wsprintfA(line + len, " %x(+%x)", sp[i], i * 4);
+    logf("%s", line);
+}
+static BOOL off_map(float x, float y) { return x != x || y != y || x > FAR_LIMIT || x < -FAR_LIMIT || y > FAR_LIMIT || y < -FAR_LIMIT; }
+__attribute__((used)) static void __cdecl obj_moved(DWORD obj, DWORD *arg, const DWORD *sp)     /* arg: old matrix, old position, old angle */
+{
+    DWORD *q = (DWORD *)(ULONG_PTR)obj;
+    const DWORD *om, *op;
+    float x, y, ox, oy;
+    if (obj < 0x10000 || arg[0] < 0x10000 || arg[1] < 0x10000) return;
+    x = *(const float *)&q[5]; y = *(const float *)&q[9];
+    if (x != x || y != y || !off_map(x, y)) return;          /* not a number: the game destroys the object itself */
+    om = (const DWORD *)(ULONG_PTR)arg[0]; op = (const DWORD *)(ULONG_PTR)arg[1];
+    ox = *(const float *)&op[0]; oy = *(const float *)&op[1];
+    if (off_map(ox, oy)) return;                              /* it was not on the map before either: nothing to go back to */
+    g_far_kept++;
+    if (g_far_kept <= 12 || !(g_far_kept % 1000))
+    {
+        DWORD tmpl = q[1];
+        logf("far object: a unit at x %d, y %d was about to be moved to x %d, y %d, z %d (%08x %08x %08x) and is kept where it was; object %08x, time number %u of this kind",
+             whole(ox), whole(oy), whole(x), whole(y), whole(*(const float *)&q[13]), q[5], q[9], q[13], obj, g_far_kept);
+        if (mem_ok(tmpl, 0x30)) { g_names_left = 1; note_text(*(const DWORD *)(ULONG_PTR)(tmpl + 0x2c), "its kind"); }
+        note_callers(sp);
+        /* The knock-back's launch routine (0x792dbd) is on the stack when its call to 0x792997 returns to 0x793087
+         * (seen at sp+DCh, its frame pointer saved just below): what it worked with. It lands the unit at
+         * position + speed * N frames; N comes from fabs(2 * up-speed / (gravity * factor)) through a float-to-int
+         * conversion, and a result that does not fit becomes 80000000h = 2147483648 frames. */
+        if (mem_ok((DWORD)(ULONG_PTR)sp, 0xe0) && sp[0xdc / 4] == 0x793087 && mem_ok(sp[0xd8 / 4] - 0x30, 0x48))
+        {
+            const DWORD *f = (const DWORD *)(ULONG_PTR)sp[0xd8 / 4];           /* the launch routine's ebp */
+            DWORD mod = f[-4], data = mem_ok(mod, 12) ? ((const DWORD *)(ULONG_PTR)mod)[1] : 0, gd = *(const DWORD *)0xde4364;
+            logf("    knock-back launch: frames N %08x, up-speed used %08x, height above ground %08x, arc height %08x; landing %08x %08x %08x; factor %08x, gravity %08x, logic rate %d, frame rate %d",
+                 f[-3], f[2], f[-1], f[-2], f[-7], f[-6], f[-5], mem_ok(data, 0x50) ? ((const DWORD *)(ULONG_PTR)data)[0x4c / 4] : 0xdeadbeef,
+                 mem_ok(gd, 0xc8) ? *(const DWORD *)(ULONG_PTR)(gd + 0xc4) : 0xdeadbeef, *(const int *)0xd9f608, *(const int *)0xd9f60c);
+        }
+    }
+    memcpy(q + 2, om, 48);                                    /* matrix, +8 .. +37h */
+    q[14] = op[0]; q[15] = op[1]; q[16] = op[2];              /* position, +38h */
+    q[17] = arg[2];                                           /* angle, +44h */
+}
+__attribute__((used)) static const DWORD p_obj_moved = 0x69355d;
+__attribute__((naked)) static void h_ObjMoved(void)        /* thiscall (object; old matrix, old position, old angle) */
+{
+    __asm__("pushfl\n"
+            "pushl %eax\n"
+            "movl 0x14(%ecx), %eax\n"        /* |x| as bits: larger than those of 100000.0 (0x47C35000) = far, infinite or not a number */
+            "andl $0x7fffffff, %eax\n"
+            "cmpl $0x47c35000, %eax\n"
+            "ja 1f\n"
+            "movl 0x24(%ecx), %eax\n"
+            "andl $0x7fffffff, %eax\n"
+            "cmpl $0x47c35000, %eax\n"
+            "ja 1f\n"
+            "popl %eax\n"
+            "popfl\n"
+            "jmp *_p_obj_moved\n"
+            "1:\n"
+            "popl %eax\n"
+            "popfl\n"
+            HOOK_SAVE
+            "leal 36(%ebp), %eax\n"          /* the stack as it was at entry */
+            "pushl %eax\n"
+            "leal 40(%ebp), %eax\n"          /* the three arguments */
+            "pushl %eax\n"
+            "pushl 24(%ebp)\n"               /* the object (ecx) */
+            "call _obj_moved\n"
+            "addl $12, %esp\n"
+            HOOK_RESTORE
+            "jmp *_p_obj_moved\n");
+}
 static void far_guard_install(void)
 {
-    DWORD *slot = (DWORD *)0xd0bf30, old;
+    DWORD *slot = (DWORD *)0xd0bf30, *moved = (DWORD *)0xc123ec, old;
     if (!cfg_farguard) return;
+    if (!IsBadReadPtr(moved, 4) && *moved == 0x69355d && VirtualProtect(moved, 4, PAGE_READWRITE, &old))
+    {
+        *moved = (DWORD)(ULONG_PTR)h_ObjMoved;
+        VirtualProtect(moved, 4, old, &old);
+        logf("far-object guard (a unit is not moved off the map): on");
+    }
+    else logf("far-object guard (a unit is not moved off the map): NOT applied (unexpected code)");
     if (!IsBadReadPtr(slot, 4) && *slot == 0xb6c420 && VirtualProtect(slot, 4, PAGE_READWRITE, &old))
     {
         *slot = (DWORD)(ULONG_PTR)h_CollUpdate;
         VirtualProtect(slot, 4, old, &old);
-        logf("far-object guard: on");
+        logf("far-object guard (collision manager): on");
     }
-    else logf("far-object guard: NOT applied (unexpected code)");
+    else logf("far-object guard (collision manager): NOT applied (unexpected code)");
 }
 
 static void patch_game_code(void)
