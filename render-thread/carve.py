@@ -16,7 +16,7 @@ expect(2630, 'CreateThread(NULL, 0, rtKeyThread'); rt[2629] = '    /* port: no h
 expect(2724, 'GetExceptionCode()'); rt[2723] = rt[2723].replace('(unsigned long)GetExceptionCode()', '0ul')
 expect(2729, 'static DWORD WINAPI rtKeyThread'); expect(2765, '}'); off(2729, 2765, 'the Scroll Lock hotkey thread')
 expect(2768, 'static DWORD WINAPI rtReport'); expect(2964, '}'); off(2768, 2964, 'the statistics thread reports on the whole accelerator')
-expect(2714, '// release the probes'); rt[2713] = '        if (ok) rtPortAfterInstall(dvt, *(void***)tex);     /* port: see rt_port.cpp */\n' + rt[2713]
+expect(2714, '// release the probes'); rt[2713] = '        if (ok) rtPortAfterInstall(dvt, *(void***)tex, *(void***)surf);     /* port: see rt_port.cpp */\n' + rt[2713]
 expect(3145, 'static void capFrameTick'); expect(3151, '}'); off(3145, 3151, 'needs the engine hooks')
 open(os.path.join(out, 'aotr_rt.inc'), 'w', encoding='utf-8').write('\n'.join(rt))
 for name in ('aotr_rt_gen.inc', 'aotr_rtmirror.inc', 'aotr_capture.inc'):
