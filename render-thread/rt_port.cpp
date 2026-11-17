@@ -189,7 +189,11 @@ static char* perStr(LONG64 num, LONG64 den, char* buf) {       // num/den with o
 static volatile unsigned __int64 g_lrPresentTsc = 0;      // the logic limiter's frame mark
 static const LONG g_dgTracing = 0;                        // draw-generation tracing: off
 template <class... T> static inline void dgTraceAdd(T...) {}
-static void rtPortAfterInstall(void** dvt, void** tvt, void** svt);
+static void rtPortAfterInstall();
+static bool rtPortTCLTry(DWORD* r); static void rtPortTCLResult(DWORD r);
+static bool rtPortTexQITry(void* self, DWORD riid, DWORD ppv, DWORD* r);
+static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flags, DWORD* r);
+static bool rtPortSurfUnlockTry(void* self);
 #include "aotr_rt.inc"
 
 // ---- descriptions answered without asking Direct3D (port) ------------------------------------------------------
@@ -280,19 +284,19 @@ static void rtPortNewBuf(DWORD hr, DWORD pp, int k, DWORD length, DWORD usage, D
 static DWORD __stdcall rtPortNew26(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[26])(s, a, b, c, d, e, f); rtPortNewBuf(r, e, 1, a, b, c, d); return r; }
 static DWORD __stdcall rtPortNew27(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[27])(s, a, b, c, d, e, f); rtPortNewBuf(r, e, 2, a, b, c, d); return r; }
 // TestCooperativeLevel, which the game asks every frame: the accelerator runs it under its render lock, i.e. after
-// whatever the worker is in the middle of. While the answer is "fine" it is repeated, and asked for real every 64th time.
-static void* g_rtPortPrevTCL = NULL; static void* g_rtPortPrevTexQI = NULL;
-static DWORD __stdcall rtPortTCL(void* self) {
-    static DWORD last = 0, n = 0;
-    if (g_rtActive && __readfsdword(0x24) == g_rtMainTid && !g_rtDirectScope && last == 0 && (++n & 63)) return 0;
-    last = ((DWORD(__stdcall*)(void*))g_rtPortPrevTCL)(self);
-    return last;
+// whatever the worker is in the middle of. While the last real answer was "fine" it is repeated, and asked for real
+// every 64th time. (These shortcuts are entered from the first line of the accelerator's own hooks, see carve.py.)
+static DWORD g_rtPortTCLLast = 0, g_rtPortTCLN = 0;
+static bool rtPortTCLTry(DWORD* r) {
+    if (!g_rtActive || __readfsdword(0x24) != g_rtMainTid || g_rtDirectScope || g_rtPortTCLLast != 0 || !(++g_rtPortTCLN & 63)) return false;
+    *r = 0; return true;
 }
+static void rtPortTCLResult(DWORD r) { g_rtPortTCLLast = r; }
 // A texture's QueryInterface, also per frame and also under the render lock in the accelerator: in Wine's Direct3D 9 it
 // only compares the interface id and counts a reference (interlocked), so the game's thread calls it as it is.
-static DWORD __stdcall rtPortTexQI(void* self, DWORD riid, DWORD ppv) {
-    if (g_rtActive && __readfsdword(0x24) == g_rtMainTid && !g_rtDirectScope) return ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtO_tex[0])(self, riid, ppv);
-    return ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtPortPrevTexQI)(self, riid, ppv);
+static bool rtPortTexQITry(void* self, DWORD riid, DWORD ppv, DWORD* r) {
+    if (!g_rtActive || __readfsdword(0x24) != g_rtMainTid || g_rtDirectScope) return false;
+    *r = ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtO_tex[0])(self, riid, ppv); return true;
 }
 RT_PORT_NEW(28, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h), (s, a, b, c, d, e, f, g, h))
 RT_PORT_NEW(29, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h), (s, a, b, c, d, e, f, g, h))
@@ -311,7 +315,7 @@ struct RtPortSM { DWORD surf, w, h, l, t, r, b, lastFrame; BYTE* mem; BYTE live,
 static RtPortSM g_rtPortSM[8];
 static DWORD g_rtPortSMNo[32]; static int g_rtPortSMNoI = 0;
 static volatile LONG g_rtPortSMAny = 0, g_rtPortSMLocks = 0, g_rtPortSMAdopt = 0, g_rtPortSMDrop = 0;
-static void* g_rtPortPrevSurfLock = NULL; static void* g_rtPortPrevSurfUnlock = NULL;
+static LONG g_rtPortSMOff = 0;
 static BYTE* g_rtPortSMTmp = NULL;
 static RtPortSM* rtPortSMFind(DWORD s) { for (int i = 0; i < 8; ++i) if (g_rtPortSM[i].live && g_rtPortSM[i].surf == s) return &g_rtPortSM[i]; return NULL; }
 static void rtPortSMGiveUp(RtPortSM* m) {                 // game's thread, outside a direct scope: the kept reference goes back through the queue
@@ -334,27 +338,31 @@ static RtPortSM* rtPortSMAdoptSurf(void* self) {
     if (!g_rtPortSMTmp) g_rtPortSMTmp = (BYTE*)VirtualAlloc(NULL, 256 * 256 * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!m->mem || !g_rtPortSMTmp) return NULL;
     struct { INT pitch; void* bits; } lr = { 0, NULL };
-    if ((LONG)((DWORD(__stdcall*)(void*, void*, void*, DWORD))g_rtPortPrevSurfLock)(self, &lr, NULL, 0x10) < 0 || !lr.bits) { g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; return NULL; }   // the one real read
-    for (DWORD y = 0; y < h; ++y) memcpy(m->mem + y * w * 4, (BYTE*)lr.bits + (INT)y * lr.pitch, w * 4);
-    ((DWORD(__stdcall*)(void*))g_rtPortPrevSurfUnlock)(self);
+    rtDrain(); rtExecLock(); g_rtDirectScope++;                                                       // the one real read: after everything queued, with the device to ourselves
+    LONG hr = (LONG)((DWORD(__stdcall*)(void*, void*, void*, DWORD))g_rtO_surf[13])(self, &lr, NULL, 0x10);
+    if (hr >= 0 && lr.bits) for (DWORD y = 0; y < h; ++y) memcpy(m->mem + y * w * 4, (BYTE*)lr.bits + (INT)y * lr.pitch, w * 4);
+    if (hr >= 0) ((DWORD(__stdcall*)(void*))g_rtO_surf[14])(self);
+    g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+    if (hr < 0 || !lr.bits) { g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; return NULL; }
     ((DWORD(__stdcall*)(void*))g_rtO_surf[1])(self);                                                  // AddRef: kept while the copy lives
     m->surf = s; m->w = w; m->h = h; m->locked = 0; m->write = 0; m->lastFrame = g_mkFrames; m->live = 1; g_rtPortSMAny = 1; g_rtPortSMAdopt++;
     return m;
 }
-static DWORD __stdcall rtPortSurfLock(void* self, DWORD pLocked, DWORD pRect, DWORD flags) {
+static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flags, DWORD* ret) {
+    if (g_rtPortSMOff) return false;
     DWORD s = (DWORD)(ULONG_PTR)self;
     if (g_rtActive && __readfsdword(0x24) == g_rtMainTid && !g_rtDirectScope) {
         RtPortSM* m = pLocked ? rtPortSMFind(s) : NULL;
         if (!m && pLocked) m = rtPortSMAdoptSurf(self);
         if (m) {
-            if (m->locked) return 0x8876086Cu;                                                       // D3DERR_INVALIDCALL: it is locked already
+            if (m->locked) { *ret = 0x8876086Cu; return true; }                                      // D3DERR_INVALIDCALL: it is locked already
             DWORD l = 0, t = 0, r = m->w, b = m->h;
             if (pRect) { const LONG* rc = (const LONG*)(ULONG_PTR)pRect; l = (DWORD)rc[0]; t = (DWORD)rc[1]; r = (DWORD)rc[2]; b = (DWORD)rc[3]; }
             if (l < r && t < b && r <= m->w && b <= m->h) {
                 m->l = l; m->t = t; m->r = r; m->b = b; m->locked = 1; m->write = !(flags & 0x10); m->lastFrame = g_mkFrames;
                 ((INT*)(ULONG_PTR)pLocked)[0] = (INT)(m->w * 4); ((void**)(ULONG_PTR)pLocked)[1] = m->mem + (t * m->w + l) * 4;
                 g_rtPortSMLocks++;
-                return 0;
+                *ret = 0; return true;
             }
             rtPortSMGiveUp(m);                                                                        // a rectangle outside it: not for the copy
         }
@@ -362,37 +370,27 @@ static DWORD __stdcall rtPortSurfLock(void* self, DWORD pLocked, DWORD pRect, DW
         RtPortSM* m = rtPortSMFind(s);
         if (m && !m->locked) { m->live = 0; g_rtPortSMDrop++; g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; }   // (its reference stays: rare, and a release here would not be in order)
     }
-    return ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD))g_rtPortPrevSurfLock)(self, pLocked, pRect, flags);
+    return false;
 }
-static DWORD __stdcall rtPortSurfUnlock(void* self) {
-    if (g_rtPortSMAny && g_rtActive && __readfsdword(0x24) == g_rtMainTid && !g_rtDirectScope) {
-        RtPortSM* m = rtPortSMFind((DWORD)(ULONG_PTR)self);
-        if (m && m->locked) {
-            m->locked = 0;
-            if (m->write) {
-                DWORD w = m->r - m->l, h = m->b - m->t, row = w * 4, bytes = row * h;
-                for (DWORD y = 0; y < h; ++y) memcpy(g_rtPortSMTmp + y * row, m->mem + ((m->t + y) * m->w + m->l) * 4, row);
-                RtRec* rec = rtAlloc(9, bytes); rec->kind = 7; rec->op = 304;
-                DWORD* A = rtArgs(rec); BYTE* P = rtPayload(rec); DWORD po = 0;
-                A[0] = m->surf; A[1] = m->l; A[2] = m->t; A[3] = m->r; A[4] = m->b; A[5] = 4;
-                A[6] = rtBytes(P, &po, (DWORD)(ULONG_PTR)g_rtPortSMTmp, bytes);
-                A[7] = (DWORD)(ULONG_PTR)g_rtO_surf[13]; A[8] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
-                rtTouch(m->surf); rtCommit(rec, po);
-            }
-            return 0;
-        }
+static bool rtPortSurfUnlockTry(void* self) {
+    if (!g_rtPortSMAny || !g_rtActive || __readfsdword(0x24) != g_rtMainTid || g_rtDirectScope) return false;
+    RtPortSM* m = rtPortSMFind((DWORD)(ULONG_PTR)self);
+    if (!m || !m->locked) return false;
+    m->locked = 0;
+    if (m->write) {
+        DWORD w = m->r - m->l, h = m->b - m->t, row = w * 4, bytes = row * h;
+        for (DWORD y = 0; y < h; ++y) memcpy(g_rtPortSMTmp + y * row, m->mem + ((m->t + y) * m->w + m->l) * 4, row);
+        RtRec* rec = rtAlloc(9, bytes); rec->kind = 7; rec->op = 304;
+        DWORD* A = rtArgs(rec); BYTE* P = rtPayload(rec); DWORD po = 0;
+        A[0] = m->surf; A[1] = m->l; A[2] = m->t; A[3] = m->r; A[4] = m->b; A[5] = 4;
+        A[6] = rtBytes(P, &po, (DWORD)(ULONG_PTR)g_rtPortSMTmp, bytes);
+        A[7] = (DWORD)(ULONG_PTR)g_rtO_surf[13]; A[8] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
+        rtTouch(m->surf); rtCommit(rec, po);
     }
-    return ((DWORD(__stdcall*)(void*))g_rtPortPrevSurfUnlock)(self);
+    return true;
 }
-static void rtPortSlot(void** slot, void* fn, void** prev) {
-    DWORD op = 0; *prev = *slot;
-    if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &op)) { *slot = fn; VirtualProtect(slot, sizeof(void*), op, &op); }
-}
-static void rtPortAfterInstall(void** dvt, void** tvt, void** svt) {  // the originals are in the accelerator's tables now: put the answering versions in their place
-    if (dvt) rtPortSlot(&dvt[3], (void*)&rtPortTCL, &g_rtPortPrevTCL);
-    if (tvt) rtPortSlot(&tvt[0], (void*)&rtPortTexQI, &g_rtPortPrevTexQI);
-    char off[8]; off[0] = 0; char mk[MAX_PATH]; wsprintfA(mk, "%s\\renderthread.nosurfcopy", g_dir);
-    if (svt && GetFileAttributesA(mk) == INVALID_FILE_ATTRIBUTES) { rtPortSlot(&svt[13], (void*)&rtPortSurfLock, &g_rtPortPrevSurfLock); rtPortSlot(&svt[14], (void*)&rtPortSurfUnlock, &g_rtPortPrevSurfUnlock); }
+static void rtPortAfterInstall() {                       // the originals are in the accelerator's tables now: put the answering versions in their place
+    { char mk[MAX_PATH]; wsprintfA(mk, "%s\\renderthread.nosurfcopy", g_dir); g_rtPortSMOff = GetFileAttributesA(mk) != INVALID_FILE_ATTRIBUTES; }
     g_rtPortReal[0] = g_rtO_surf[12]; g_rtO_surf[12] = (void*)&rtPortSurfDesc;
     g_rtPortReal[1] = g_rtO_vb[13];   g_rtO_vb[13]   = (void*)&rtPortVbDesc;
     g_rtPortReal[2] = g_rtO_ib[13];   g_rtO_ib[13]   = (void*)&rtPortIbDesc;
