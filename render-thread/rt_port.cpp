@@ -481,7 +481,7 @@ static void rtPortWhere(DWORD tid, char* out) {            // "module+offset <- 
     HMODULE hm = NULL; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(ULONG_PTR)c.Eip, &hm);
     int n = lstrlenA(out); n += wsprintfA(out + n, "%s+%X", own, c.Eip - (DWORD)(ULONG_PTR)hm);
     int shown = 0;
-    for (int i = 0; i < ns && shown < 9 && n < 380; ++i) {
+    for (int i = 0; i < ns && shown < 9 && n < 420 - 80; ++i) {   // out holds 420 bytes; one entry adds at most 3 + 63 + 1 + 8
         DWORD v = st[i];
         if (v < 0x00401000 || !rtIsCode(v)) continue;
         const BYTE* p = (const BYTE*)(ULONG_PTR)v;         // a return address follows a call instruction

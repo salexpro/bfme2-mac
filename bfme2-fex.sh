@@ -149,7 +149,9 @@ fi
 # ---- our files in the game folder ---------------------------------------------------------------------------
 TMP=$(mktemp -d -t bfme2) || TMP=""
 put "$T/letterbox/d3d9.dll" d3d9.dll
-[ -f "$T/render-thread/renderthread.dll" ] && put "$T/render-thread/renderthread.dll" renderthread.dll
+# the render thread: in the game folder only while render-thread/renderthread.dll is here (taken out again otherwise)
+if [ -f "$T/render-thread/renderthread.dll" ]; then put "$T/render-thread/renderthread.dll" renderthread.dll
+elif [ -n "$GAME" ] && [ -f "$GAME/renderthread.dll" ]; then rm -f "$GAME/renderthread.dll" && say "removed renderthread.dll from the game folder"; fi
 if [ -n "$TMP" ] && [ -f "$T/letterbox/letterbox.ini" ]; then
   grep -v -E '^(topinset|refresh|valign|gamefps|gamew|gameh)=' "$T/letterbox/letterbox.ini" > "$TMP/letterbox.ini"
   gfps=30; [ -e "$T/sage-unlocked/disabled" ] || gfps="${FPS:-30}"
