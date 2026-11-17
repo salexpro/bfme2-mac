@@ -2086,13 +2086,20 @@ __attribute__((naked)) static void h_SetLogicInterp(void)
  *    animals animated at 5 fps. The check is true only on the first drawn frame of phase 1 now. */
 static DWORD g_p1_frame = 0xffffffff;
 static DWORD g_p1_asks;                   /* per log window: how often the game was told "first frame of the tick" */
+static volatile LONG g_game_frame_id;     /* goes up once per frame of the game's thread when the render thread reports them */
+static LONG g_p1_seen_id; static DWORD g_p1_frames;      /* per log window: on how many of the game's frames it was told so */
 static BOOL g_seen_other_phase = TRUE;
 __attribute__((used)) static DWORD __cdecl first_phase_once(void *engine)
 {
     DWORD phase = *(DWORD *)((BYTE *)engine + 0x34);
     if (phase != 1) { g_seen_other_phase = TRUE; return 0; }
     if (g_seen_other_phase) { g_seen_other_phase = FALSE; g_p1_frame = g_frame_no; }
-    if (g_frame_no == g_p1_frame) { g_p1_asks++; return 1; }
+    if (g_frame_no == g_p1_frame)
+    {
+        g_p1_asks++;
+        if (g_p1_seen_id != g_game_frame_id) { g_p1_seen_id = g_game_frame_id; g_p1_frames++; }     /* (only counted when the render thread reports the game's frames) */
+        return 1;
+    }
     return 0;
 }
 __attribute__((naked)) static void h_IsFirstPhase(void)      /* thiscall, engine in ecx; ecx and edx are kept */
@@ -2617,10 +2624,17 @@ static void renderthread_load(void)
     if (g_rt_dll)
     {
         void (__cdecl *set)(void (__cdecl *)(void)) = (void *)GetProcAddress(g_rt_dll, "RtPortSetFrameTick");
-        if (!cfg_rtgameframe) set = NULL;                  /* rtgameframe=0 (test aid): leave the boundary at Present */
         if (set) set(lb_game_frame);
-        logf("render thread: frame boundaries %s", set ? "are reported from the game's thread" : "stay at Present (this renderthread.dll has no RtPortSetFrameTick): effects will run too fast");
+        logf("render thread: frame boundaries %s", !set ? "stay at Present (this renderthread.dll has no RtPortSetFrameTick): effects can run too fast" : cfg_rtgameframe ? "are reported from the game's thread" : "stay at Present (rtgameframe=0, a test setting): effects can run too fast");
     }
+}
+static BOOL in_module(HMODULE mod, const void *p)      /* is p an address inside that module's image? */
+{
+    const BYTE *base = (const BYTE *)mod;
+    const IMAGE_NT_HEADERS *nt;
+    if (!mod) return FALSE;
+    nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    return (const BYTE *)p >= base && (const BYTE *)p < base + nt->OptionalHeader.SizeOfImage;
 }
 static void hook_d3dx(void)
 {
@@ -2647,7 +2661,7 @@ static void hook_d3dx(void)
     {
         /* only if the slot really holds that import (this is the 1.06/1.09 game.dat layout) */
         /* (with the render thread loaded the slot already holds its hook: this one goes on top and calls it) */
-        if (!IsBadReadPtr(h[i].slot, 4) && (*h[i].slot == (void *)GetProcAddress(dx, h[i].name) || g_rt_dll)) { patch_slot(h[i].slot, h[i].fn, h[i].orig); logf("hooked d3dx9_27!%s", h[i].name); }
+        if (!IsBadReadPtr(h[i].slot, 4) && (*h[i].slot == (void *)GetProcAddress(dx, h[i].name) || in_module(g_rt_dll, *h[i].slot))) { patch_slot(h[i].slot, h[i].fn, h[i].orig); logf("hooked d3dx9_27!%s", h[i].name); }
         else logf("NOT hooked d3dx9_27!%s (unexpected import layout)", h[i].name);
     }
 }
@@ -2867,6 +2881,8 @@ static void frame_boundary(void)
 }
 static void __cdecl lb_game_frame(void)       /* called by renderthread.dll on the game's thread when the game presents a frame */
 {
+    InterlockedIncrement(&g_game_frame_id);
+    if (!cfg_rtgameframe) return;             /* test aid: the boundary stays at Present */
     frame_boundary();
     InterlockedIncrement(&g_game_frames);
 }
@@ -2929,12 +2945,10 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
     rec_frame(dev);
     {
         /* The frame boundary. With the render thread this Present runs on its worker, after the game's thread has
-         * gone on (often by a whole frame), so the game's thread reports its own frame boundaries (lb_game_frame)
-         * and nothing is done here; without it, or until it reports, this is the boundary. */
-        static LONG seen;
-        LONG c = g_game_frames;
-        if (c == seen) frame_boundary();
-        seen = c;
+         * gone on (often by a whole frame), so the game's thread reports its own frame boundaries (lb_game_frame):
+         * once it has reported one it reports every frame (also when the render thread only passes calls through),
+         * and nothing is done here any more. Without the render thread this is the boundary. */
+        if (!g_game_frames) frame_boundary();
         g_prev_draws = fr.draws;
         g_wd_frames++;
     }
@@ -2969,8 +2983,9 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         if (frames) logf("  per frame: %u draws, %u vertex-buffer locks, %u index-buffer locks", g_win_draws / frames, g_win_vblocks / frames, g_win_iblocks / frames);
         g_win_draws = g_win_vblocks = g_win_iblocks = 0;
         { static DWORD kb_said, dec_said; if (g_heap_reserved_kb != kb_said || g_heap_decommits != dec_said) { logf("  heapkeep: %u MB of the game's reserved heap ranges kept committed so far, %u decommits kept accessible", g_heap_reserved_kb >> 10, g_heap_decommits); kb_said = g_heap_reserved_kb; dec_said = g_heap_decommits; } }
-        logf("  logic: %u ticks started; a tick was held back %u times, %u frames in all, longest %u frames; \"first frame of the tick\" answered %u times (%u per tick)", g_ticks_seen, g_holds, g_hold_frames, g_hold_longest, g_p1_asks, g_ticks_seen ? (g_p1_asks + g_ticks_seen / 2) / g_ticks_seen : 0);
-        g_p1_asks = 0;
+        logf("  logic: %u ticks started; a tick was held back %u times, %u frames in all, longest %u frames; \"first frame of the tick\" answered %u times (%u per tick), on %u frames of the game (%u.%02u per tick)", g_ticks_seen, g_holds, g_hold_frames, g_hold_longest, g_p1_asks, g_ticks_seen ? (g_p1_asks + g_ticks_seen / 2) / g_ticks_seen : 0,
+             g_p1_frames, g_ticks_seen ? g_p1_frames / g_ticks_seen : 0, g_ticks_seen ? (g_p1_frames * 100 / g_ticks_seen) % 100 : 0);
+        g_p1_asks = 0; g_p1_frames = 0;
         g_holds = g_hold_frames = g_hold_longest = g_ticks_seen = 0;
         cswait_report(frames);
         prof_window(frames);
@@ -3109,20 +3124,22 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
         cswait_install();
         heapkeep_scan();
         crash_note_install();
-        patch_slot(&vt[14], lb_GetSwapChain, (void **)&o_GetSwapChain);
-        patch_slot(&vt[16], lb_Reset, (void **)&o_Reset);
-        patch_slot(&vt[17], lb_Present, (void **)&o_Present);
-        patch_slot(&vt[18], lb_GetBackBuffer, (void **)&o_GetBackBuffer);
+        /* The device's method table is patched once. (A second device shares the table; and once the render thread
+         * has put its hooks on top, patching again would make these hooks and its hooks each other's originals.) */
+        if (!o_GetSwapChain) patch_slot(&vt[14], lb_GetSwapChain, (void **)&o_GetSwapChain);
+        if (!o_Reset) patch_slot(&vt[16], lb_Reset, (void **)&o_Reset);
+        if (!o_Present) patch_slot(&vt[17], lb_Present, (void **)&o_Present);
+        if (!o_GetBackBuffer) patch_slot(&vt[18], lb_GetBackBuffer, (void **)&o_GetBackBuffer);
         renderthread_load();
         hook_d3dx();
         { static BOOL once; if (!once && cfg_jumpbudget) { once = TRUE; set_jump_budget(cfg_jumpbudget); } }
-        patch_slot(&vt[23], lb_CreateTex, (void **)&o_CreateTex);
-        patch_slot(&vt[26], lb_CreateVB, (void **)&o_CreateVB);
-        patch_slot(&vt[27], lb_CreateIB, (void **)&o_CreateIB);
-        patch_slot(&vt[41], lb_BeginScene, (void **)&o_BeginScene);
-        patch_slot(&vt[42], lb_EndScene, (void **)&o_EndScene);
-        patch_slot(&vt[81], lb_DP, (void **)&o_DP);
-        patch_slot(&vt[82], lb_DIP, (void **)&o_DIP);
+        if (!o_CreateTex) patch_slot(&vt[23], lb_CreateTex, (void **)&o_CreateTex);
+        if (!o_CreateVB) patch_slot(&vt[26], lb_CreateVB, (void **)&o_CreateVB);
+        if (!o_CreateIB) patch_slot(&vt[27], lb_CreateIB, (void **)&o_CreateIB);
+        if (!o_BeginScene) patch_slot(&vt[41], lb_BeginScene, (void **)&o_BeginScene);
+        if (!o_EndScene) patch_slot(&vt[42], lb_EndScene, (void **)&o_EndScene);
+        if (!o_DP) patch_slot(&vt[81], lb_DP, (void **)&o_DP);
+        if (!o_DIP) patch_slot(&vt[82], lb_DIP, (void **)&o_DIP);
         if (lb) create_rt(*out, &real);
     }
     else g.on = FALSE;
