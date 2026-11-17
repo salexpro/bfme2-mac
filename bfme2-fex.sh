@@ -149,10 +149,16 @@ fi
 # ---- our files in the game folder ---------------------------------------------------------------------------
 TMP=$(mktemp -d -t bfme2) || TMP=""
 put "$T/letterbox/d3d9.dll" d3d9.dll
+[ -f "$T/render-thread/renderthread.dll" ] && put "$T/render-thread/renderthread.dll" renderthread.dll
 if [ -n "$TMP" ] && [ -f "$T/letterbox/letterbox.ini" ]; then
   grep -v -E '^(topinset|refresh|valign|gamefps|gamew|gameh)=' "$T/letterbox/letterbox.ini" > "$TMP/letterbox.ini"
   gfps=30; [ -e "$T/sage-unlocked/disabled" ] || gfps="${FPS:-30}"
   printf 'topinset=%s\r\nrefresh=%s\r\nvalign=%s\r\ngamefps=%s\r\ngamew=%s\r\ngameh=%s\r\n' "${INSET:-0}" "${HZ:-0}" "$([ "${VALIGN:-}" = top ] && echo 1 || echo 0)" "$gfps" "${RES% *}" "${RES#* }" >> "$TMP/letterbox.ini"
+  # LETTERBOX_EXTRA="key=value key=value" (e.g. from display-override.conf): proxy settings for this start only
+  for kv in ${LETTERBOX_EXTRA:-}; do
+    grep -v "^${kv%%=*}=" "$TMP/letterbox.ini" > "$TMP/letterbox.ini.2" && mv "$TMP/letterbox.ini.2" "$TMP/letterbox.ini"
+    printf '%s\r\n' "$kv" >> "$TMP/letterbox.ini"; say "letterbox.ini for this start: $kv"
+  done
   put "$TMP/letterbox.ini" letterbox.ini
 else
   put "$T/letterbox/letterbox.ini" letterbox.ini

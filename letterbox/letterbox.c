@@ -1823,8 +1823,13 @@ static HRESULT WINAPI lb_CreateIB(IDirect3DDevice9 *dev, UINT len, DWORD usage, 
     if (SUCCEEDED(hr) && out && *out)
     {
         void **vt = *(void ***)*out;
-        patch_slot(&vt[11], lb_IBLock, (void **)&o_IBLock);
-        patch_slot(&vt[12], lb_IBUnlock, (void **)&o_IBUnlock);
+        /* once: with the render thread loaded its hooks go on top of these, and patching again would put these on
+         * top of its hooks with its hooks as their originals: each would then call the other for ever */
+        if (!o_IBLock)
+        {
+            patch_slot(&vt[11], lb_IBLock, (void **)&o_IBLock);
+            patch_slot(&vt[12], lb_IBUnlock, (void **)&o_IBUnlock);
+        }
     }
     return hr;
 }
@@ -1835,8 +1840,13 @@ static HRESULT WINAPI lb_CreateVB(IDirect3DDevice9 *dev, UINT len, DWORD usage, 
     if (SUCCEEDED(hr) && out && *out)
     {
         void **vt = *(void ***)*out;
-        patch_slot(&vt[11], lb_VBLock, (void **)&o_VBLock);
-        patch_slot(&vt[12], lb_VBUnlock, (void **)&o_VBUnlock);
+        /* once: with the render thread loaded its hooks go on top of these, and patching again would put these on
+         * top of its hooks with its hooks as their originals: each would then call the other for ever */
+        if (!o_VBLock)
+        {
+            patch_slot(&vt[11], lb_VBLock, (void **)&o_VBLock);
+            patch_slot(&vt[12], lb_VBUnlock, (void **)&o_VBUnlock);
+        }
     }
     return hr;
 }
@@ -2575,6 +2585,22 @@ static void patch_game_code(void)
     }
 }
 
+/* ---- render thread (renderthread=1; experimental, off by default) ----
+ * renderthread.dll (render-thread/ in this repository: the render thread of BFME2 Accelerator, MIT licence) records
+ * every Direct3D and D3DX effect call of the game and runs them on a second thread, so the game's thread no longer
+ * waits for Wine's Direct3D. It patches the same method tables as this proxy, on top of it: the proxy's own patches of
+ * the device are all in place when it is loaded (here, during CreateDevice), and the proxy's hooks then run on that
+ * second thread. It has to be loaded before the proxy touches the game's D3DX imports: it finds them by their address. */
+static int cfg_renderthread = 0;
+static HMODULE g_rt_dll;
+static void renderthread_load(void)
+{
+    WCHAR path[MAX_PATH];
+    if (!cfg_renderthread || g_rt_dll) return;
+    lstrcpyW(path, g_dir); lstrcatW(path, L"\\renderthread.dll");
+    g_rt_dll = LoadLibraryW(path);
+    logf("render thread: renderthread.dll %s (err %u)", g_rt_dll ? "loaded, see renderthread.log" : "NOT loaded", g_rt_dll ? 0 : GetLastError());
+}
 static void hook_d3dx(void)
 {
     static BOOL done;
@@ -2599,7 +2625,8 @@ static void hook_d3dx(void)
     for (i = 0; i < 3; i++)
     {
         /* only if the slot really holds that import (this is the 1.06/1.09 game.dat layout) */
-        if (!IsBadReadPtr(h[i].slot, 4) && *h[i].slot == (void *)GetProcAddress(dx, h[i].name)) { patch_slot(h[i].slot, h[i].fn, h[i].orig); logf("hooked d3dx9_27!%s", h[i].name); }
+        /* (with the render thread loaded the slot already holds its hook: this one goes on top and calls it) */
+        if (!IsBadReadPtr(h[i].slot, 4) && (*h[i].slot == (void *)GetProcAddress(dx, h[i].name) || g_rt_dll)) { patch_slot(h[i].slot, h[i].fn, h[i].orig); logf("hooked d3dx9_27!%s", h[i].name); }
         else logf("NOT hooked d3dx9_27!%s (unexpected import layout)", h[i].name);
     }
 }
@@ -2651,8 +2678,11 @@ static HRESULT WINAPI lb_CreateTex(IDirect3DDevice9 *dev, UINT w, UINT h, UINT l
     if (SUCCEEDED(hr) && out && *out)
     {
         void **vt = *(void ***)*out;
-        patch_slot(&vt[19], lb_TexLock, (void **)&o_TexLock);
-        patch_slot(&vt[20], lb_TexUnlock, (void **)&o_TexUnlock);
+        if (!o_TexLock)                                /* once, see lb_CreateVB */
+        {
+            patch_slot(&vt[19], lb_TexLock, (void **)&o_TexLock);
+            patch_slot(&vt[20], lb_TexUnlock, (void **)&o_TexUnlock);
+        }
         if ((IDirect3DBaseTexture9 *)*out == g_ring_tex) g_ring_tex = NULL;      /* that address belongs to another texture now */
         { int q; for (q = 0; q < 8; q++) if (g_ring_no[q] == (IDirect3DBaseTexture9 *)*out) g_ring_no[q] = NULL; }
     }
@@ -3043,6 +3073,7 @@ static HRESULT WINAPI lb_CreateDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE 
         patch_slot(&vt[16], lb_Reset, (void **)&o_Reset);
         patch_slot(&vt[17], lb_Present, (void **)&o_Present);
         patch_slot(&vt[18], lb_GetBackBuffer, (void **)&o_GetBackBuffer);
+        renderthread_load();
         hook_d3dx();
         { static BOOL once; if (!once && cfg_jumpbudget) { once = TRUE; set_jump_budget(cfg_jumpbudget); } }
         patch_slot(&vt[23], lb_CreateTex, (void **)&o_CreateTex);
@@ -3190,6 +3221,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
             cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
             cfg_ringhd = (int)GetPrivateProfileIntW(L"letterbox", L"ringhd", 1, ini);
+            cfg_renderthread = (int)GetPrivateProfileIntW(L"letterbox", L"renderthread", 0, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
