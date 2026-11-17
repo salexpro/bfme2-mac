@@ -206,7 +206,8 @@ static void* g_rtPortReal[8];
 static volatile LONG g_rtPortDescHit = 0, g_rtPortDescMiss = 0;
 static __forceinline RtPortDescE* rtPortDescFind(int k, DWORD obj, DWORD key) {
     RtPortDescE* e = &g_rtPortDC[k][((obj >> 4) ^ (key * 31)) & 2047];
-    return (e->obj == obj && e->key == key && e->gen == g_rtPortGen) ? e : NULL;
+    if (e->obj != obj || e->key != key || !e->gen) return NULL;
+    return (k == 1 || k == 2 || e->gen == g_rtPortGen) ? e : NULL;      // buffers are forgotten one by one when their address is reused; the rest by generation
 }
 static __forceinline RtPortDescE* rtPortDescSlot(int k, DWORD obj, DWORD key) { return &g_rtPortDC[k][((obj >> 4) ^ (key * 31)) & 2047]; }
 static __forceinline DWORD rtPortDesc2(int k, int real, int bytes, void* self, DWORD pDesc) {         // GetDesc(self, desc)
@@ -239,6 +240,22 @@ static DWORD __stdcall rtPortTexLevelCount(void* self) {                        
     e = rtPortDescSlot(3, (DWORD)(ULONG_PTR)self, 0x80000000u); e->gen = 0; e->obj = (DWORD)(ULONG_PTR)self; e->key = 0x80000000u; e->hr = n; e->gen = gen;
     return n;
 }
+// GetSurfaceLevel(self, level, &surface): the game asks a texture for its level surface again and again (the radar,
+// the terrain pages). In Wine it is "take the global lock, look the surface up, count a reference". The surface of a
+// level never changes while the texture lives, and counting a reference on it needs no lock, so a remembered answer is
+// the same thing without the wait.
+static DWORD __stdcall rtPortTexSurfLevel(void* self, DWORD level, DWORD ppSurf) {
+    if (!ppSurf || level >= 0x1000 || __readfsdword(0x24) != g_rtMainTid) return ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtPortReal[5])(self, level, ppSurf);
+    RtPortDescE* e = rtPortDescFind(3, (DWORD)(ULONG_PTR)self, 0x40000000u | level);
+    if (e && e->hr) {
+        ((DWORD(__stdcall*)(void*))g_rtO_surf[1])((void*)(ULONG_PTR)e->hr);                          // AddRef, as GetSurfaceLevel does
+        *(DWORD*)(ULONG_PTR)ppSurf = e->hr; g_rtPortDescHit++; return 0;
+    }
+    LONG gen = g_rtPortGen;
+    DWORD hr = ((DWORD(__stdcall*)(void*, DWORD, DWORD))g_rtPortReal[5])(self, level, ppSurf); g_rtPortDescMiss++;
+    if ((LONG)hr >= 0 && *(DWORD*)(ULONG_PTR)ppSurf) { e = rtPortDescSlot(3, (DWORD)(ULONG_PTR)self, 0x40000000u | level); e->gen = 0; e->obj = (DWORD)(ULONG_PTR)self; e->key = 0x40000000u | level; e->hr = *(DWORD*)(ULONG_PTR)ppSurf; e->gen = gen; }
+    return hr;
+}
 // the creation calls: the real one, then everything remembered above is void
 static void* g_rtPortRealNew[40];
 #define RT_PORT_NEW(SLOT, ARGS, PASS) static DWORD __stdcall rtPortNew##SLOT ARGS { DWORD r = ((DWORD(__stdcall*) ARGS)g_rtPortRealNew[SLOT]) PASS; InterlockedIncrement(&g_rtPortGen); return r; }
@@ -248,13 +265,20 @@ RT_PORT_NEW(23, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, 
 RT_PORT_NEW(24, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g, DWORD h, DWORD i), (s, a, b, c, d, e, f, g, h, i))
 RT_PORT_NEW(25, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f, DWORD g), (s, a, b, c, d, e, f, g))
 // a new vertex or index buffer: only what was remembered for its address is void (they are created while playing)
-static void rtPortForgetBuf(DWORD pp) {
+// (its description is what it was created with, so it is remembered at once when the game's thread created it)
+static void rtPortNewBuf(DWORD hr, DWORD pp, int k, DWORD length, DWORD usage, DWORD fmtOrFvf, DWORD pool) {
     if (!pp || IsBadReadPtr((void*)(ULONG_PTR)pp, 4)) return;
     DWORD o = *(DWORD*)(ULONG_PTR)pp; if (!o) return;
-    for (int k = 1; k <= 2; ++k) { RtPortDescE* e = rtPortDescSlot(k, o, 0); if (e->obj == o) InterlockedExchange(&e->gen, 0); }
+    for (int i = 1; i <= 2; ++i) { RtPortDescE* e = rtPortDescSlot(i, o, 0); if (e->obj == o) InterlockedExchange(&e->gen, 0); }
+    if ((LONG)hr < 0 || __readfsdword(0x24) != g_rtMainTid) return;
+    RtPortDescE* e = rtPortDescSlot(k, o, 0); DWORD* d = (DWORD*)e->d;
+    e->gen = 0; e->obj = o; e->key = 0; e->hr = 0;
+    if (k == 1) { d[0] = 100; d[1] = 6; d[2] = usage; d[3] = pool; d[4] = length; d[5] = fmtOrFvf; }      // D3DVERTEXBUFFER_DESC: VERTEXDATA, VERTEXBUFFER, usage, pool, size, FVF
+    else        { d[0] = fmtOrFvf; d[1] = 7; d[2] = usage; d[3] = pool; d[4] = length; }                  // D3DINDEXBUFFER_DESC: format, INDEXBUFFER, usage, pool, size
+    e->gen = g_rtPortGen;
 }
-static DWORD __stdcall rtPortNew26(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[26])(s, a, b, c, d, e, f); rtPortForgetBuf(e); return r; }
-static DWORD __stdcall rtPortNew27(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[27])(s, a, b, c, d, e, f); rtPortForgetBuf(e); return r; }
+static DWORD __stdcall rtPortNew26(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[26])(s, a, b, c, d, e, f); rtPortNewBuf(r, e, 1, a, b, c, d); return r; }
+static DWORD __stdcall rtPortNew27(void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f) { DWORD r = ((DWORD(__stdcall*)(void*, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD))g_rtPortRealNew[27])(s, a, b, c, d, e, f); rtPortNewBuf(r, e, 2, a, b, c, d); return r; }
 // TestCooperativeLevel, which the game asks every frame: the accelerator runs it under its render lock, i.e. after
 // whatever the worker is in the middle of. While the answer is "fine" it is repeated, and asked for real every 64th time.
 static void* g_rtPortPrevTCL = NULL; static void* g_rtPortPrevTexQI = NULL;
@@ -285,6 +309,7 @@ static void rtPortAfterInstall(void** dvt, void** tvt) {  // the originals are i
     g_rtPortReal[2] = g_rtO_ib[13];   g_rtO_ib[13]   = (void*)&rtPortIbDesc;
     g_rtPortReal[3] = g_rtO_tex[17];  g_rtO_tex[17]  = (void*)&rtPortTexLevelDesc;
     g_rtPortReal[4] = g_rtO_tex[13];  g_rtO_tex[13]  = (void*)&rtPortTexLevelCount;
+    g_rtPortReal[5] = g_rtO_tex[18];  g_rtO_tex[18]  = (void*)&rtPortTexSurfLevel;
     static const int slots[10] = { 13, 16, 23, 24, 25, 26, 27, 28, 29, 36 };
     static void* const news[10] = { (void*)&rtPortNew13, (void*)&rtPortNew16, (void*)&rtPortNew23, (void*)&rtPortNew24, (void*)&rtPortNew25, (void*)&rtPortNew26, (void*)&rtPortNew27, (void*)&rtPortNew28, (void*)&rtPortNew29, (void*)&rtPortNew36 };
     for (int i = 0; i < 10; ++i) { g_rtPortRealNew[slots[i]] = g_rtO_dev[slots[i]]; g_rtO_dev[slots[i]] = news[i]; }
@@ -421,6 +446,17 @@ static void rtPortStats() {                               // per period: what st
          (int)f, perStr((LONG64)(seq - lSeq), f, a), perStr(D - lD, f, b), msStr(DT - lDT, f, c), msStr(PW - lPW, f, d), perStr(S - lSync, f, e));
     { static LONG lM = 0, lJ = 0; LONG M = g_rtPortNMap, J = g_rtPortNJoined; char m1[32], m2[32];
       logf("stats:   staged buffer writes per frame: %s maps, %s more joined to them", perStr(M - lM, f, m1), perStr(J - lJ, f, m2)); lM = M; lJ = J; }
+    { static LONG lLS[RT_LSN]; LONG dl[RT_LSN]; for (int i = 0; i < RT_LSN; ++i) { LONG n = g_rtLS[i].n; dl[i] = g_rtLS[i].ra ? n - lLS[i] : 0; lLS[i] = n; }
+      for (int k = 0; k < 8; ++k) {
+          int bi = -1; for (int i = 0; i < RT_LSN; ++i) if (dl[i] > 0 && (bi < 0 || dl[i] > dl[bi])) bi = i;
+          if (bi < 0) break;
+          RtLockStat& e = g_rtLS[bi]; char own[64], pf[16]; HMODULE hm = NULL;
+          GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(ULONG_PTR)e.ra, &hm); rtOwner(e.ra, own, 64);
+          logf("stats:   lock of a %s from %s+%X: pool %d, format %d, usage %X, %dx%d, flags %X, %s, %s per frame", (e.flags & 0x80000000u) ? "texture" : "surface", own, e.ra - (DWORD)(ULONG_PTR)hm,
+               (int)e.pool, (int)e.fmt, (unsigned)e.usage, (int)e.w, (int)e.h, (unsigned)(e.flags & 0x7FFFFFFFu), e.fast ? "run directly under the render lock" : "after waiting for the queue", perStr(dl[bi], f, pf));
+          dl[bi] = 0;
+      }
+      logf("stats:   texture mirrors: %d locks served, %d adopted, %d dropped, %d failed, %d without a free slot | calls under the render lock so far %d", (int)g_rtNTMLock, (int)g_rtNTMAdopt, (int)g_rtNTMDrop, (int)g_rtNTMFail, (int)g_rtNTMNoSlot, (int)g_rtNLocked); }
     lP = P; lD = D; lDT = DT; lPW = PW; lSeq = seq; lSync = S;
     LONG64 dOp[512]; for (int i = 0; i < 512; ++i) { LONG64 v = rd64(&g_rtDrainOpTicks[i]); dOp[i] = v - lOpT[i]; lOpT[i] = v; }
     for (int k = 0; k < 6; ++k) {

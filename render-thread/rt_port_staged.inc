@@ -17,6 +17,7 @@ static void rtPortExecStaged(RtRec* r, DWORD* a) {
             for (int n = 0; n < 3000 && pos != head && nj < 96; ++n) {
                 RtRec* q = (RtRec*)(g_rtBuf + pos);
                 if (q->kind == 2 || !q->size) break;                 // the ring wraps here: far enough
+                if (q->kind == 1 && q->nargs && rtArgs(q)[0] == a[0]) break;        // a call on the buffer itself (Release, a plain Lock ...): not past it
                 if (q->kind == 3) {
                     DWORD* qa = rtArgs(q);
                     if (qa[0] == a[0]) {
