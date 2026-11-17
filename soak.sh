@@ -1,7 +1,8 @@
 #!/bin/bash
 # Test automation: load a saved skirmish and let it run, to see whether the game survives.
 #   soak.sh [minutes, default 20] [row of the save in the load screen's Skirmish tab, default 1]
-# Ends early when the game exits (crash) or stops finishing frames (freeze). Prints one result line, the frame rate
+# Ends early when the game exits (crash), stops finishing frames (freeze) or the match is over (score screen).
+# Prints one result line, the frame rate
 # at the end and, when display-override.conf has "export FEX_SILENTLOG=0", the address of the crash from the
 # emulator's log. The game is closed at the end unless KEEP=1. FRESH=1 starts a new skirmish (the setup the game
 # remembers) instead of loading a save.
@@ -15,6 +16,9 @@ while [ $(( $(date +%s) - start )) -lt $(( MIN * 60 )) ]; do
   pgrep -x game.dat >/dev/null || { r="GAME EXITED after $(( ($(date +%s) - start) / 60 )) min"; break; }
   f=$(tr -d '\r' < "$G/letterbox.log" 2>/dev/null | grep -c '^fps')
   [ "$f" = "$pf" ] && { r="NO FRAMES for 40 s (freeze) after $(( ($(date +%s) - start) / 60 )) min"; break; }
+  # the match is over (score screen: under 250 draws a frame in the last three 10 s windows; a match never goes below 300)
+  over=$(tr -d '\r' < "$G/letterbox.log" 2>/dev/null | grep 'per frame: [0-9]* draws' | tail -3 | awk '$3 + 0 < 250 { k++ } END { print k + 0 }')
+  [ "$over" = 3 ] && [ $(( $(date +%s) - start )) -gt 120 ] && { r="clean, the match ended by itself after $(( ($(date +%s) - start) / 60 )) min"; break; }
   pf=$f; sleep 40
 done
 echo "$r | last fps: $(tr -d '\r' < "$G/letterbox.log" | grep '^fps' | tail -3 | awk '{printf "%s ", $2}')| $(tr -d '\r' < "$G/letterbox.log" | grep 'per frame: [0-9]* draws' | tail -1 | sed 's/^ *//')"
