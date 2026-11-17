@@ -26,6 +26,7 @@ No game files are included. You need your own installation of the game.
 | The game freezes for good in a long or big match (one thread at 100 %, no more frames) | A write of the game into a part of its own heap that is not committed is a crash on Windows; the FEX emulator turns it into an endless fault loop. `heapkeep` in `letterbox/d3d9.dll` keeps the game's reserved heap ranges accessible, so the write lands in unused memory. (What makes the game write there: see "Big matches" below.) |
 | Crash in the middle of a match, in a network game on both machines at the same moment (access violation at `game.dat` 0x404A21) | A bug of this proxy up to release v1.1, not of the game: `game.dat` was compiled as one unit and keeps values in registers across its own calls, and three of the proxy's hooks were plain C functions that changed them (the tint-flash hook returned with a number in `edx` that the game then used as a pointer). Every hook inside the game's code is now an assembly routine that keeps all registers, the flags and the FPU/SSE state. |
 | Low frame rate in battles although the GPU is idle | Measured with the proxy's own profilers: Wine's Direct3D 9 runs on macOS OpenGL with a helper thread, every vertex-buffer write of the game is a synchronous round trip to that thread, and every OpenGL call is an expensive emulator crossing. `noglcheck` stops the error query after each OpenGL call (+12 %), `spinwait` (keeps the helper thread polling instead of sleeping between the round trips) gave another 12 % in a short test but froze the game in a longer one; it is off and should stay off. |
+| Battles still fall to 12–20 fps on an M1 Max and to 20–35 on an M5: the game's thread spends most of a frame waiting for Wine's Direct3D | A render thread (`renderthread`, on by default, see [Render thread](#render-thread)) records the game's Direct3D calls and replays them on a second thread. In the same saved battle the mean went from 29–30 to 52 fps on an M1 Max and from 53 to 86 on an M5. |
 | In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
 | The title screen's spinning ring is a coarse oval in an oval hole | The ring is a small video drawn under the title picture and seen through a hole in it. `make-art.py` squeezes the hole's mask (`titlescreenuserinterface.png`) together with the picture, the proxy draws the ring's quad narrower (`ringround`) and has the game play the larger of its two copies of the video, 128x128 instead of 64x64 (`ringhd`). |
@@ -76,6 +77,7 @@ bfme2-fex.sh            launch wrapper (Steam launch options:  "<path>/bfme2-fex
 options-template.ini    first Options.ini for a new prefix
 letterbox/              the d3d9.dll proxy: letterbox.c, letterbox.ini (all settings, commented), build.sh
 sage-unlocked/          SAGE Unlocked v1.9.6 source, the patched Unlocker.cs, bfme2-fex.patch, build.sh
+render-thread/          optional render thread (carved out of BFME2 Accelerator): build.sh, carve.py, rt_port.cpp
 setup/                  setup-prefix.sh + prefix-setup.reg (prepare the prefix), copy-to-another-mac.sh
 widescreen-art/         make-art.py (logo, loading screen and HUD overrides per picture shape, from your own files),
                         hud.py (the HUD for any shape), loading-screen/ (the 16:9 loading pictures)
@@ -96,7 +98,8 @@ BFME_URL="steam://rungameid/<game id of the shortcut>"
 - `letterbox/letterbox.ini`: every switch of the proxy, each with a comment. `Ctrl+Shift+F` in the game toggles a
   frame-rate counter.
 - `display-override.conf` next to the wrapper pins values the wrapper would otherwise measure:
-  `RES="1920 1080"`, `FPS=60`, `INSET=0`, `VALIGN=top`.
+  `RES="1920 1080"`, `FPS=60`, `INSET=0`, `VALIGN=top`, and `LETTERBOX_EXTRA="key=value ..."` for settings of the proxy
+  that are to differ from `letterbox.ini` (e.g. `LETTERBOX_EXTRA="renderthread=0"`).
 - An empty file `sage-unlocked/disabled` starts the game without the frame-rate unlock (stock 30 fps).
 
 ## Big matches
@@ -123,23 +126,58 @@ over a logic tick, so steady movers do not hitch five times a second). It was sw
 blamed on it; the stress tests that pointed at it most likely just differed in whether a cave troll got knocked
 back. It stays off until it has been through long matches again.
 
+## Render thread
+
+Wine's Direct3D 9 takes one global lock in every call and, on macOS OpenGL, makes every buffer lock a round trip to
+its own helper thread; the game's thread spends most of a battle frame waiting for it. `render-thread/` carves the
+render thread out of [BFME2 Accelerator](https://github.com/OhadBaehr/bfme2-accelerator) by Ohad Baehr (MIT, commit
+c993d9a): every Direct3D 9 and D3DX effect call of the game is recorded into a ring and replayed on a second thread,
+and the game's thread goes on with the next frame. On top of the accelerator's code the port answers description,
+buffer and surface queries from memory (they would otherwise wait for the replay), joins queued buffer writes into one
+lock, keeps the animated mouse pointer's small surface in memory, and replaces the accelerator's Windows exception
+handling with a guard that works in a 32-bit DLL built with Zig's compiler.
+
+It is on (`renderthread=1` in `letterbox/letterbox.ini`) whenever `render-thread/renderthread.dll` is there: in the
+release zip, or built with `render-thread/build.sh`, which fetches the accelerator's source. Without the DLL the game
+runs as before. `renderthread=0`, or `LETTERBOX_EXTRA="renderthread=0"` in `display-override.conf` for one start,
+turns it off. The wrapper copies the DLL into the game folder; `letterbox.log` then says "render thread:
+renderthread.dll loaded" and `renderthread.log` in the game folder "RENDER THREAD LIVE". It needs the emulator's
+default memory ordering: do not combine it with `FEX_TSOENABLED=0`.
+
+The same saved battle, 10 minutes, measured in 10-second windows, without and with it:
+
+| | mean fps | worst minute | lowest 10 s |
+|---|---|---|---|
+| MacBook Pro M1 Max, 1728x1084 | 29–30 → 52 | 18–19 → 37 | 12 → 25 |
+| Mac Studio M5, 2880x1620 | 53 → 86 | 26 → 57 | 20 → 53 |
+
+Tested: two 8-player skirmishes against the AI played to their end (30 and 33 minutes), the saved battle several
+times on both Macs, and a 15-minute LAN match with it on both (in sync: the same money on both screens). It changes
+how frames are drawn, not what the game computes. Not tested yet: a played network battle, long sessions on the M5,
+switching away from the game during a match. An empty file `renderthread.monitor` in the game folder makes
+`renderthread.log` report every few seconds what the game's thread waited for.
+
 ## Test aids
 
 The proxy reads a command file (`letterbox.cmd` in the game folder): screenshots of the game's own frame, mouse
 moves and clicks, a per-frame recorder (brightness, frame time), memory peeks. The scripts in the root use it:
 `enter-skirmish.sh`, `scroll-test.sh`, `tickrate.sh`, `interp-trace.sh`, `menu-rec.sh`, `select-rec.sh`,
 `ring-rec.sh`, `bring-rec.sh`, `lan-lobby.sh`, `lan-match.sh`, `bench.sh` (load a saved skirmish and measure the
-frame rate), `soak.sh` (let a save or a fresh skirmish run and report a crash or freeze), `renderer.sh`. They need no screen-recording permission.
+frame rate), `soak.sh` (let a save or a fresh skirmish run and report a crash or freeze; it stops when the match is over), `renderer.sh`. They need no screen-recording permission.
 
 ## Licence
 
-GPL-3.0, see `LICENSE`. `sage-unlocked/` is derived from SAGE Unlocked (GPL-3.0); the rest is original work under the
-same licence. No game files, no artwork and no Microsoft files are included.
+GPL-3.0, see `LICENSE`. `sage-unlocked/` is derived from SAGE Unlocked (GPL-3.0). `render-thread/` builds on
+BFME2 Accelerator (MIT, `render-thread/LICENSE.accelerator`): `build.sh` fetches its source, `carve.py` copies the
+parts used, and `rt_port.cpp` contains code taken from it next to the port's own. The rest is original work under
+GPL-3.0. No game files, no artwork and no Microsoft files are included.
 
 ## Credits
 
 - [SAGE Unlocked](https://github.com/TheeHorse/SAGE-Unlocked) by TheeHorse, GPL-3.0. `sage-unlocked/` contains its
   v1.9.6 source and a modified copy; the changes are in `sage-unlocked/bfme2-fex.patch`.
+- [BFME2 Accelerator](https://github.com/OhadBaehr/bfme2-accelerator) by Ohad Baehr, MIT: the render thread in
+  `render-thread/`.
 - The BFME community: All in One Launcher and Patch 1.09.
 - NotProton, CrossOver / Wine, FEX-Emu.
 
