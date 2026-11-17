@@ -2604,7 +2604,7 @@ static void patch_game_code(void)
     }
 }
 
-/* ---- render thread (renderthread=1; experimental, off by default) ----
+/* ---- render thread (renderthread=1, the default; 0 = off) ----
  * renderthread.dll (render-thread/ in this repository: the render thread of BFME2 Accelerator, MIT licence) records
  * every Direct3D and D3DX effect call of the game and runs them on a second thread, so the game's thread no longer
  * waits for Wine's Direct3D. It patches the same method tables as this proxy, on top of it: the proxy's own patches of
@@ -3278,7 +3278,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_farguard = (int)GetPrivateProfileIntW(L"letterbox", L"farguard", 1, ini);
             cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
             cfg_ringhd = (int)GetPrivateProfileIntW(L"letterbox", L"ringhd", 1, ini);
-            cfg_renderthread = (int)GetPrivateProfileIntW(L"letterbox", L"renderthread", 0, ini);
+            cfg_renderthread = (int)GetPrivateProfileIntW(L"letterbox", L"renderthread", 1, ini);
             cfg_rtgameframe = (int)GetPrivateProfileIntW(L"letterbox", L"rtgameframe", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);

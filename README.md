@@ -26,7 +26,7 @@ No game files are included. You need your own installation of the game.
 | The game freezes for good in a long or big match (one thread at 100 %, no more frames) | A write of the game into a part of its own heap that is not committed is a crash on Windows; the FEX emulator turns it into an endless fault loop. `heapkeep` in `letterbox/d3d9.dll` keeps the game's reserved heap ranges accessible, so the write lands in unused memory. (What makes the game write there: see "Big matches" below.) |
 | Crash in the middle of a match, in a network game on both machines at the same moment (access violation at `game.dat` 0x404A21) | A bug of this proxy up to release v1.1, not of the game: `game.dat` was compiled as one unit and keeps values in registers across its own calls, and three of the proxy's hooks were plain C functions that changed them (the tint-flash hook returned with a number in `edx` that the game then used as a pointer). Every hook inside the game's code is now an assembly routine that keeps all registers, the flags and the FPU/SSE state. |
 | Low frame rate in battles although the GPU is idle | Measured with the proxy's own profilers: Wine's Direct3D 9 runs on macOS OpenGL with a helper thread, every vertex-buffer write of the game is a synchronous round trip to that thread, and every OpenGL call is an expensive emulator crossing. `noglcheck` stops the error query after each OpenGL call (+12 %), `spinwait` (keeps the helper thread polling instead of sleeping between the round trips) gave another 12 % in a short test but froze the game in a longer one; it is off and should stay off. |
-| Battles still fall to 12–20 fps on an M1 Max and to 20–35 on an M5: the game's thread spends most of a frame waiting for Wine's Direct3D | Optional and experimental (off by default): a render thread (`renderthread=1`, see [Render thread](#render-thread-experimental-off-by-default)) records the game's Direct3D calls and replays them on a second thread. In the same saved battle the mean went from 29–30 to 52 fps on an M1 Max and from 53 to 86 on an M5. |
+| Battles still fall to 12–20 fps on an M1 Max and to 20–35 on an M5: the game's thread spends most of a frame waiting for Wine's Direct3D | A render thread (`renderthread`, on by default, see [Render thread](#render-thread)) records the game's Direct3D calls and replays them on a second thread. In the same saved battle the mean went from 29–30 to 52 fps on an M1 Max and from 53 to 86 on an M5. |
 | In a network game the machine that waits for the other one drops to about 70 % of its frame-rate cap (43 fps at a 60 cap) | The game's network throttle, which at 30 fps slowed the logic, is taken off the frame limiter (`netfps`); the logic waits for the network by itself. |
 | Main-menu logo and the start-up loading screen are stretched | `widescreen-art/make-art.py` builds pre-squeezed copies from your own game files. |
 | The title screen's spinning ring is a coarse oval in an oval hole | The ring is a small video drawn under the title picture and seen through a hole in it. `make-art.py` squeezes the hole's mask (`titlescreenuserinterface.png`) together with the picture, the proxy draws the ring's quad narrower (`ringround`) and has the game play the larger of its two copies of the video, 128x128 instead of 64x64 (`ringhd`). |
@@ -99,7 +99,7 @@ BFME_URL="steam://rungameid/<game id of the shortcut>"
   frame-rate counter.
 - `display-override.conf` next to the wrapper pins values the wrapper would otherwise measure:
   `RES="1920 1080"`, `FPS=60`, `INSET=0`, `VALIGN=top`, and `LETTERBOX_EXTRA="key=value ..."` for settings of the proxy
-  that are to differ from `letterbox.ini` (e.g. `LETTERBOX_EXTRA="renderthread=1"`).
+  that are to differ from `letterbox.ini` (e.g. `LETTERBOX_EXTRA="renderthread=0"`).
 - An empty file `sage-unlocked/disabled` starts the game without the frame-rate unlock (stock 30 fps).
 
 ## Big matches
@@ -126,7 +126,7 @@ over a logic tick, so steady movers do not hitch five times a second). It was sw
 blamed on it; the stress tests that pointed at it most likely just differed in whether a cave troll got knocked
 back. It stays off until it has been through long matches again.
 
-## Render thread (experimental, off by default)
+## Render thread
 
 Wine's Direct3D 9 takes one global lock in every call and, on macOS OpenGL, makes every buffer lock a round trip to
 its own helper thread; the game's thread spends most of a battle frame waiting for it. `render-thread/` carves the
@@ -137,9 +137,10 @@ buffer and surface queries from memory (they would otherwise wait for the replay
 lock, keeps the animated mouse pointer's small surface in memory, and replaces the accelerator's Windows exception
 handling with a guard that works in a 32-bit DLL built with Zig's compiler.
 
-To use it: `render-thread/renderthread.dll` (in the release zip, or built with `render-thread/build.sh`, which
-fetches the accelerator's source) and `renderthread=1` in `letterbox/letterbox.ini`, or `LETTERBOX_EXTRA="renderthread=1"`
-in `display-override.conf`. The wrapper copies the DLL into the game folder; `letterbox.log` then says "render thread:
+It is on (`renderthread=1` in `letterbox/letterbox.ini`) whenever `render-thread/renderthread.dll` is there: in the
+release zip, or built with `render-thread/build.sh`, which fetches the accelerator's source. Without the DLL the game
+runs as before. `renderthread=0`, or `LETTERBOX_EXTRA="renderthread=0"` in `display-override.conf` for one start,
+turns it off. The wrapper copies the DLL into the game folder; `letterbox.log` then says "render thread:
 renderthread.dll loaded" and `renderthread.log` in the game folder "RENDER THREAD LIVE". It needs the emulator's
 default memory ordering: do not combine it with `FEX_TSOENABLED=0`.
 
