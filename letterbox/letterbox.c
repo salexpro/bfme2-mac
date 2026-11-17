@@ -2443,6 +2443,88 @@ static void far_guard_install(void)
     else logf("far-object guard (collision manager): NOT applied (unexpected code)");
 }
 
+/* ---- particle effects at the game's own speed (pfxstep=1) ----
+ * The FX particle manager (TheFXParticleSystemManager at 0xde3744; its update is 0x5f5123, slot 28h of the method
+ * tables 0xbdac10 and 0xbf7a00) moves every particle system on by one fixed step per call, without a clock (a
+ * system's start delay, for one, is simply counted down by one per call), and the game calls it once per drawn
+ * frame. That is 30 steps a second at the original 30 fps, 50 a second at 50 fps and 120 a second at 120 fps: smoke,
+ * fire, spell effects and the bats over a goblin fortress ran at "frame rate / 30" times their speed, and got faster
+ * and slower as the frame rate went up and down. (SAGE Unlocked evens this out for the other games of the engine,
+ * not for this one.) Both slots are pointed at a gate that lets a step through once per 33.3 ms of real time and
+ * never more than one per call: below 30 fps there is one step per frame and the effects run slower than real time,
+ * as they do in the original game below 30 fps. */
+#define PFX_STEP_MS (1000.0 / 30.0)
+static int cfg_pfxstep = 1;
+__attribute__((used)) static const DWORD p_pfx_update = 0x5f5123;
+__attribute__((used)) static int __cdecl pfx_step_due(void)
+{
+    static LARGE_INTEGER last;
+    static double acc = PFX_STEP_MS;          /* time that has come together for the next step; the first call steps */
+    static double avg = PFX_STEP_MS;          /* smoothed time between two calls */
+    static double real_ms;
+    static DWORD calls, steps;
+    LARGE_INTEGER now;
+    double ms, tol;
+    int due;
+    if (!g_qpf.QuadPart) QueryPerformanceFrequency(&g_qpf);
+    QueryPerformanceCounter(&now);
+    ms = last.QuadPart ? (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)g_qpf.QuadPart : 0.0;
+    last = now;
+    if (ms < 0) ms = 0;
+    if (ms > 100) { ms = 100; acc = PFX_STEP_MS; }       /* a hitch, a loading pause: this call steps, nothing more is owed for the gap */
+    else acc += ms;
+    avg += (ms - avg) * 0.1;
+    /* The calls come a frame apart, give or take some jitter, so at 60, 90 or 120 fps the sum would sit right on the
+     * 33.3 ms mark at every 2nd, 3rd or 4th call and the jitter would decide which call steps. Half a frame of
+     * tolerance puts the mark between two calls there, so the steps come evenly; a step taken early is paid back
+     * (acc goes below zero), the rate stays 30 a second. Written so that a broken timer lets every call step. */
+    tol = avg * 0.5;
+    if (tol > PFX_STEP_MS * 0.5) tol = PFX_STEP_MS * 0.5;
+    due = !(acc < PFX_STEP_MS - tol);
+    if (due)
+    {
+        acc -= PFX_STEP_MS;
+        if (acc > PFX_STEP_MS) acc = PFX_STEP_MS;         /* one step per call; no more than one further step is kept owed */
+        steps++;
+    }
+    calls++; real_ms += ms;
+    if (real_ms >= 30000.0)
+    {
+        int tenths = (int)(steps * 10000.0 / real_ms + 0.5);
+        logf("particle steps: %u in %u frames and %d ms (%d.%d a second)", steps, calls, (int)real_ms, tenths / 10, tenths % 10);
+        calls = steps = 0; real_ms = 0;
+    }
+    return due;
+}
+__attribute__((naked)) static void h_PfxUpdate(void)         /* thiscall, the manager in ecx, no arguments, nothing returned */
+{
+    __asm__("pushl %ecx\n"
+            "call _pfx_step_due\n"
+            "popl %ecx\n"
+            "testl %eax, %eax\n"
+            "jz 1f\n"
+            "jmp *_p_pfx_update\n"
+            "1: ret\n");
+}
+static void pfx_step_install(void)
+{
+    static const DWORD slots[] = { 0xbdac38, 0xbf7a28 };
+    static const BYTE head[] = { 0xB8, 0x89, 0xF6, 0xB7, 0x00, 0xE8 };       /* mov eax, 0xb7f689 / call ... */
+    DWORD old;
+    int i, n = 0;
+    if (!cfg_pfxstep) return;
+    if (!IsBadReadPtr((void *)(ULONG_PTR)p_pfx_update, sizeof(head)) && !memcmp((void *)(ULONG_PTR)p_pfx_update, head, sizeof(head)))
+        for (i = 0; i < 2; i++)
+        {
+            DWORD *s = (DWORD *)(ULONG_PTR)slots[i];
+            if (IsBadReadPtr(s, 4) || *s != p_pfx_update || !VirtualProtect(s, 4, PAGE_READWRITE, &old)) continue;
+            *s = (DWORD)(ULONG_PTR)h_PfxUpdate;
+            VirtualProtect(s, 4, old, &old);
+            n++;
+        }
+    logf("particle effects at 30 steps a second: %s", n == 2 ? "on" : n ? "only partly applied (unexpected code)" : "NOT applied (unexpected code)");
+}
+
 static void patch_game_code(void)
 {
     static const DWORD tint_sites[] = { 0x6757aa, 0x67597d, 0x675dd1, 0x675e1c, 0x675e86, 0x675ed4, 0x67910e };
@@ -2476,6 +2558,7 @@ static void patch_game_code(void)
         if (cfg_logicinterp) for (i = 0; i < 4; i++) if (retarget_call(interp_sites[i], 0x63256f, h_SetLogicInterp)) m++;
         logf("logic-side interpolation fraction phase/6: %d of 4 places", m);
         if (cfg_ringtiming) patch_selection_ring();
+        pfx_step_install();
         if (cfg_netfps)
         {
             static const BYTE fmul_net[6] = { 0xD8, 0x0D, 0x98, 0xF4, 0xD9, 0x00 };      /* fmul dword [0xd9f498] */
@@ -3111,6 +3194,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);
             cfg_realframelen = (int)GetPrivateProfileIntW(L"letterbox", L"realframelen", 1, ini);
+            cfg_pfxstep = (int)GetPrivateProfileIntW(L"letterbox", L"pfxstep", 1, ini);
             cfg_sync = (int)GetPrivateProfileIntW(L"letterbox", L"syncpresent", -1, ini);
             cfg_refresh = GetPrivateProfileIntW(L"letterbox", L"refresh", 0, ini);
             cfg_syncsleep = GetPrivateProfileIntW(L"letterbox", L"syncsleep", 3000, ini);

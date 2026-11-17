@@ -18,6 +18,7 @@ No game files are included. You need your own installation of the game.
 | Locked to 30 fps | A patched build of [SAGE Unlocked](https://github.com/TheeHorse/SAGE-Unlocked) (`sage-unlocked/`) runs the game at the display's refresh rate with game logic at its normal 5 ticks per second. |
 | With the unlock under the FEX emulator the game ran 3x too fast | Fixed in the patched SAGE Unlocked (its scheduler kept data on its own code page). |
 | With the unlock, fades, animations and the selection ring stepped or ran at the wrong speed | Corrections in `letterbox/d3d9.dll`: the per-tick latch fires once per tick, the animation clock follows the real frame time, flash and ring timings are scaled. |
+| With the unlock, smoke, fire, spell effects and the bats over a goblin fortress run too fast, and faster the higher the frame rate (four times too fast at 120 fps) | The game moves its particle effects on by one fixed step per drawn frame. `pfxstep` in `letterbox/d3d9.dll` lets a step through 30 times a second, as at the original 30 fps (the effects then move in 30 steps a second, as they always did). |
 | Uneven frame pacing (micro-stutter on steadily moving things) | While the Mac holds the refresh rate, frames are locked to the real buffer swap and the game gets a regular per-frame clock. |
 | 16:9 trims the top and bottom of what 4:3 shows | The camera's field of view is widened so the 4:3 height is kept and the sides are added (`horplus`). |
 | Round command buttons over buildings are ovals at 16:9 | Drawn round. |
