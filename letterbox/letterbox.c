@@ -2085,13 +2085,15 @@ __attribute__((naked)) static void h_SetLogicInterp(void)
  *    became equal to cur, and the value stood still for the rest of the tick: fades climbed in 200 ms steps, birds and
  *    animals animated at 5 fps. The check is true only on the first drawn frame of phase 1 now. */
 static DWORD g_p1_frame = 0xffffffff;
+static DWORD g_p1_asks;                   /* per log window: how often the game was told "first frame of the tick" */
 static BOOL g_seen_other_phase = TRUE;
 __attribute__((used)) static DWORD __cdecl first_phase_once(void *engine)
 {
     DWORD phase = *(DWORD *)((BYTE *)engine + 0x34);
     if (phase != 1) { g_seen_other_phase = TRUE; return 0; }
     if (g_seen_other_phase) { g_seen_other_phase = FALSE; g_p1_frame = g_frame_no; }
-    return g_frame_no == g_p1_frame;
+    if (g_frame_no == g_p1_frame) { g_p1_asks++; return 1; }
+    return 0;
 }
 __attribute__((naked)) static void h_IsFirstPhase(void)      /* thiscall, engine in ecx; ecx and edx are kept */
 {
@@ -2152,18 +2154,28 @@ static void frame_len_hook(void)          /* (re)install; SAGE Unlocked may patc
     g_fl_hooked = TRUE;
 }
 
-static void frame_len_tick(void)          /* once per frame, at Present */
+static volatile LONG g_game_frames;       /* frame boundaries reported by the render thread from the game's thread (see frame_boundary) */
+static void frame_len_tick(void)          /* once per frame, at the frame boundary */
 {
     LARGE_INTEGER now;
-    double ms;
-    static DWORD n;
+    double ms, real;
+    static DWORD n, note_n;
+    static double given_ms, real_ms;
     if (!cfg_realframelen || cfg_gamefps <= 30) return;
     if (!(n++ % 120)) frame_len_hook();
     if (!g_qpf.QuadPart) QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&now);
-    if (g_sync_on && g_vt_valid && g_fl_last_vt > 0 && g_vt_ms > g_fl_last_vt) ms = g_vt_ms - g_fl_last_vt;      /* locked: the regular clock */
-    else ms = g_fl_last.QuadPart ? (double)(now.QuadPart - g_fl_last.QuadPart) * 1000.0 / (double)g_qpf.QuadPart : 1000.0 / cfg_gamefps;
+    real = g_fl_last.QuadPart ? (double)(now.QuadPart - g_fl_last.QuadPart) * 1000.0 / (double)g_qpf.QuadPart : 1000.0 / cfg_gamefps;
+    /* locked pacing: the regular clock (not with the render thread: the swaps happen on its worker, not in step with the game's frames) */
+    if (!g_game_frames && g_sync_on && g_vt_valid && g_fl_last_vt > 0 && g_vt_ms > g_fl_last_vt) ms = g_vt_ms - g_fl_last_vt;
+    else ms = real;
     g_fl_last = now; g_fl_last_vt = g_sync_on && g_vt_valid ? g_vt_ms : 0;
+    given_ms += g_fl_ms * (33.3333 / g_fl_base); real_ms += real > 100 ? 100 : real;       /* what the frame that just ended was given */
+    if (++note_n >= 1200)
+    {
+        logf("animation clock: given %d ms in %d ms of real time (%d %%)", (int)given_ms, (int)real_ms, real_ms > 0 ? (int)(given_ms * 100.0 / real_ms + 0.5) : 0);
+        note_n = 0; given_ms = real_ms = 0;
+    }
     if (ms < 0) ms = 0;
     if (ms > 100) ms = 100;                /* a hitch or a loading pause must not make everything leap */
     g_avg_frame_ms = g_avg_frame_ms > 0 ? g_avg_frame_ms * 0.95 + ms * 0.05 : ms;
@@ -2593,6 +2605,8 @@ static void patch_game_code(void)
  * second thread. It has to be loaded before the proxy touches the game's D3DX imports: it finds them by their address. */
 static int cfg_renderthread = 0;
 static HMODULE g_rt_dll;
+static void __cdecl lb_game_frame(void);
+static int cfg_rtgameframe = 1;
 static void renderthread_load(void)
 {
     WCHAR path[MAX_PATH];
@@ -2600,6 +2614,13 @@ static void renderthread_load(void)
     lstrcpyW(path, g_dir); lstrcatW(path, L"\\renderthread.dll");
     g_rt_dll = LoadLibraryW(path);
     logf("render thread: renderthread.dll %s (err %u)", g_rt_dll ? "loaded, see renderthread.log" : "NOT loaded", g_rt_dll ? 0 : GetLastError());
+    if (g_rt_dll)
+    {
+        void (__cdecl *set)(void (__cdecl *)(void)) = (void *)GetProcAddress(g_rt_dll, "RtPortSetFrameTick");
+        if (!cfg_rtgameframe) set = NULL;                  /* rtgameframe=0 (test aid): leave the boundary at Present */
+        if (set) set(lb_game_frame);
+        logf("render thread: frame boundaries %s", set ? "are reported from the game's thread" : "stay at Present (this renderthread.dll has no RtPortSetFrameTick): effects will run too fast");
+    }
 }
 static void hook_d3dx(void)
 {
@@ -2827,6 +2848,28 @@ static void waits_report(DWORD before_scene_us)
          *(DWORD *)0xd9f498, (UINT)*(BYTE *)0xde4320);
 }
 
+/* What the game-side corrections count as "a frame has ended": the animation clock gets the frame's real length, the
+ * frame number goes up (the first-phase latch compares it), the engine's phase is looked at. It has to happen on the
+ * game's thread between two of its frames. */
+static void frame_boundary(void)
+{
+    void **eng = (void **)0xde4324;
+    frame_len_tick();
+    g_frame_no++;
+    if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40) && *(DWORD *)((BYTE *)*eng + 0x34) != 1) g_seen_other_phase = TRUE;
+    if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x60))
+    {
+        /* the engine's tick did not start this frame (phase counter above 6): how often, and for how many frames in a row */
+        static DWORD run, last_tick; DWORD ph = *(DWORD *)((BYTE *)*eng + 0x34), tick = *(DWORD *)((BYTE *)*eng + 0x50);
+        if (ph > 6) { g_hold_frames++; if (!run) g_holds++; run++; if (run > g_hold_longest) g_hold_longest = run; } else run = 0;
+        if (tick != last_tick) { g_ticks_seen++; last_tick = tick; }
+    }
+}
+static void __cdecl lb_game_frame(void)       /* called by renderthread.dll on the game's thread when the game presents a frame */
+{
+    frame_boundary();
+    InterlockedIncrement(&g_game_frames);
+}
 static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const RECT *dst, HWND wnd, const RGNDATA *dirty)
 {
     /* every 10 s: average fps, frame-time spread, time spent waiting in Present, and the mouse traffic */
@@ -2885,19 +2928,15 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
     rec_texcreates = fr.tex_creates;
     rec_frame(dev);
     {
-        void **eng = (void **)0xde4324;      /* frame boundary for the first-phase latch */
-        frame_len_tick();
-        g_frame_no++;
+        /* The frame boundary. With the render thread this Present runs on its worker, after the game's thread has
+         * gone on (often by a whole frame), so the game's thread reports its own frame boundaries (lb_game_frame)
+         * and nothing is done here; without it, or until it reports, this is the boundary. */
+        static LONG seen;
+        LONG c = g_game_frames;
+        if (c == seen) frame_boundary();
+        seen = c;
         g_prev_draws = fr.draws;
         g_wd_frames++;
-        if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x40) && *(DWORD *)((BYTE *)*eng + 0x34) != 1) g_seen_other_phase = TRUE;
-        if (!IsBadReadPtr(eng, 4) && *eng && !IsBadReadPtr(*eng, 0x60))
-        {
-            /* the engine's tick did not start this frame (phase counter above 6): how often, and for how many frames in a row */
-            static DWORD run, last_tick; DWORD ph = *(DWORD *)((BYTE *)*eng + 0x34), tick = *(DWORD *)((BYTE *)*eng + 0x50);
-            if (ph > 6) { g_hold_frames++; if (!run) g_holds++; run++; if (run > g_hold_longest) g_hold_longest = run; } else run = 0;
-            if (tick != last_tick) { g_ticks_seen++; last_tick = tick; }
-        }
     }
     ZeroMemory(&fr, sizeof(fr));
     fr.frame_start = qpc;
@@ -2930,7 +2969,8 @@ static HRESULT WINAPI lb_Present(IDirect3DDevice9 *dev, const RECT *src, const R
         if (frames) logf("  per frame: %u draws, %u vertex-buffer locks, %u index-buffer locks", g_win_draws / frames, g_win_vblocks / frames, g_win_iblocks / frames);
         g_win_draws = g_win_vblocks = g_win_iblocks = 0;
         { static DWORD kb_said, dec_said; if (g_heap_reserved_kb != kb_said || g_heap_decommits != dec_said) { logf("  heapkeep: %u MB of the game's reserved heap ranges kept committed so far, %u decommits kept accessible", g_heap_reserved_kb >> 10, g_heap_decommits); kb_said = g_heap_reserved_kb; dec_said = g_heap_decommits; } }
-        logf("  logic: %u ticks started; a tick was held back %u times, %u frames in all, longest %u frames", g_ticks_seen, g_holds, g_hold_frames, g_hold_longest);
+        logf("  logic: %u ticks started; a tick was held back %u times, %u frames in all, longest %u frames; \"first frame of the tick\" answered %u times (%u per tick)", g_ticks_seen, g_holds, g_hold_frames, g_hold_longest, g_p1_asks, g_ticks_seen ? (g_p1_asks + g_ticks_seen / 2) / g_ticks_seen : 0);
+        g_p1_asks = 0;
         g_holds = g_hold_frames = g_hold_longest = g_ticks_seen = 0;
         cswait_report(frames);
         prof_window(frames);
@@ -3222,6 +3262,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
             cfg_ringround = (int)GetPrivateProfileIntW(L"letterbox", L"ringround", 1, ini);
             cfg_ringhd = (int)GetPrivateProfileIntW(L"letterbox", L"ringhd", 1, ini);
             cfg_renderthread = (int)GetPrivateProfileIntW(L"letterbox", L"renderthread", 0, ini);
+            cfg_rtgameframe = (int)GetPrivateProfileIntW(L"letterbox", L"rtgameframe", 1, ini);
             cfg_steamoverlay = (int)GetPrivateProfileIntW(L"letterbox", L"steamoverlay", 0, ini);
             cfg_ringtiming = (int)GetPrivateProfileIntW(L"letterbox", L"ringtiming", 1, ini);
             cfg_netfps = (int)GetPrivateProfileIntW(L"letterbox", L"netfps", 1, ini);

@@ -29,6 +29,12 @@ def gexpect(n, text):
 gexpect(46, 'static DWORD __stdcall rt_dev_3(void* self) {'); gexpect(53, 'g_rtNLocked++; return r;')
 gen[45] += '\n    { DWORD pr_; if (rtPortTCLTry(&pr_)) return pr_; }   /* port */'
 gen[52] = gen[52].replace('g_rtNLocked++; return r;', 'g_rtNLocked++; rtPortTCLResult(r); return r;')
+# other ways a system-memory surface gets written: as the destination of GetRenderTargetData / GetFrontBufferData, through GetDC
+for i, l in enumerate(gen):
+    if l.startswith('static DWORD __stdcall rt_dev_32(void* self, DWORD a0, DWORD a1) {') or l.startswith('static DWORD __stdcall rt_dev_33(void* self, DWORD a0, DWORD a1) {'):
+        gen[i] += '\n    rtPortSMTouched(a1);   /* port */'
+    if l.startswith('static DWORD __stdcall rt_surf_15(void* self, DWORD a0) {'):
+        gen[i] += '\n    rtPortSMTouched((DWORD)(ULONG_PTR)self);   /* port */'
 gexpect(1782, 'static DWORD __stdcall rt_tex_0(void* self, DWORD a0, DWORD a1) {')
 gen[1781] += '\n    { DWORD pr_; if (rtPortTexQITry(self, a0, a1, &pr_)) return pr_; }   /* port */'
 open(os.path.join(out, 'aotr_rt_gen.inc'), 'w', encoding='utf-8').write('\n'.join(gen))

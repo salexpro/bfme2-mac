@@ -27,13 +27,21 @@ struct RtGuardScope {
     ~RtGuardScope() { if (on) rtGuardSet(g.prev); }
 };
 static LONG CALLBACK rtGuardVeh(EXCEPTION_POINTERS* ep) {
-    if ((ep->ExceptionRecord->ExceptionCode >> 30) != 3 || g_rtGuardTls >= 64) return EXCEPTION_CONTINUE_SEARCH;   // errors only
+    if (g_rtGuardTls >= 64) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;          // faults only: a C++ exception or anything else belongs to whoever expects it
+    if (code != 0xC0000005u && code != 0xC0000006u && code != 0xC000001Du && code != 0xC0000096u && code != 0xC0000094u) return EXCEPTION_CONTINUE_SEARCH;
     RtGuard* g = rtGuardCur();
     if (!g) return EXCEPTION_CONTINUE_SEARCH;
-    const _JUMP_BUFFER* jb = (const _JUMP_BUFFER*)g->jb;
     CONTEXT* c = ep->ContextRecord;
+    // The record lives in a frame of this thread's stack that is still in use: above the faulting stack pointer, below
+    // the stack's top. Anything else is not a record (and reading it could fault in here, over and over).
+    DWORD top = __readfsdword(4);
+    if ((DWORD)(ULONG_PTR)g < c->Esp || (DWORD)(ULONG_PTR)g + sizeof(RtGuard) > top || ((DWORD)(ULONG_PTR)g & 3)) { rtGuardSet(NULL); return EXCEPTION_CONTINUE_SEARCH; }
+    const _JUMP_BUFFER* jb = (const _JUMP_BUFFER*)g->jb;
     rtGuardSet(g->prev);
-    c->Ebp = jb->Ebp; c->Ebx = jb->Ebx; c->Edi = jb->Edi; c->Esi = jb->Esi; c->Esp = jb->Esp; c->Eip = jb->Eip; c->Eax = 1;
+    // As longjmp does it: _setjmp3 stored the stack pointer it was entered with (pointing at its return address), so
+    // execution resumes after the call with that address popped.
+    c->Ebp = jb->Ebp; c->Ebx = jb->Ebx; c->Edi = jb->Edi; c->Esi = jb->Esi; c->Esp = jb->Esp + 4; c->Eip = jb->Eip; c->Eax = 1;
     __writefsdword(0, jb->Registration);                      // the exception-handler chain as it was at the setjmp
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -194,6 +202,7 @@ static bool rtPortTCLTry(DWORD* r); static void rtPortTCLResult(DWORD r);
 static bool rtPortTexQITry(void* self, DWORD riid, DWORD ppv, DWORD* r);
 static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flags, DWORD* r);
 static bool rtPortSurfUnlockTry(void* self);
+static void rtPortSMTouched(DWORD s);
 #include "aotr_rt.inc"
 
 // ---- descriptions answered without asking Direct3D (port) ------------------------------------------------------
@@ -311,18 +320,20 @@ RT_PORT_NEW(36, (void* s, DWORD a, DWORD b, DWORD c, DWORD d, DWORD e, DWORD f),
 // UnlockRect" (the accelerator's own record for staged rectangle writes), so the real surface holds the same pixels
 // once the queue has run that far. A reference is kept so the surface cannot go away under the copy; a copy not used for
 // some seconds is given up, and so is one whose surface is locked in any other way (D3DX, another thread).
-struct RtPortSM { DWORD surf, w, h, l, t, r, b, lastFrame; BYTE* mem; BYTE live, locked, write; };
+struct RtPortSM { DWORD surf, w, h, l, t, r, b, lastFrame; BYTE* mem; BYTE* tmp; BYTE live, locked, write; volatile BYTE stale; };
 static RtPortSM g_rtPortSM[8];
 static DWORD g_rtPortSMNo[32]; static int g_rtPortSMNoI = 0;
 static volatile LONG g_rtPortSMAny = 0, g_rtPortSMLocks = 0, g_rtPortSMAdopt = 0, g_rtPortSMDrop = 0;
 static LONG g_rtPortSMOff = 0;
-static BYTE* g_rtPortSMTmp = NULL;
 static RtPortSM* rtPortSMFind(DWORD s) { for (int i = 0; i < 8; ++i) if (g_rtPortSM[i].live && g_rtPortSM[i].surf == s) return &g_rtPortSM[i]; return NULL; }
 static void rtPortSMGiveUp(RtPortSM* m) {                 // game's thread, outside a direct scope: the kept reference goes back through the queue
     m->live = 0; g_rtPortSMDrop++;
     int any = 0; for (int i = 0; i < 8; ++i) any |= g_rtPortSM[i].live; g_rtPortSMAny = any;
     rt_surf_2((void*)(ULONG_PTR)m->surf);
 }
+// The real surface is being written by something that is not the game's own LockRect on its thread: what the copy
+// holds is no longer the truth. Any thread may say so; the game's thread gives the copy up at its next lock.
+static void rtPortSMTouched(DWORD s) { if (g_rtPortSMAny) for (int i = 0; i < 8; ++i) if (g_rtPortSM[i].live && g_rtPortSM[i].surf == s) g_rtPortSM[i].stale = 1; }
 static RtPortSM* rtPortSMAdoptSurf(void* self) {
     DWORD s = (DWORD)(ULONG_PTR)self;
     for (int i = 0; i < 32; ++i) if (g_rtPortSMNo[i] == s) return NULL;
@@ -335,17 +346,26 @@ static RtPortSM* rtPortSMAdoptSurf(void* self) {
     for (int i = 0; i < 8 && !m; ++i) if (!g_rtPortSM[i].locked && (DWORD)(g_mkFrames - g_rtPortSM[i].lastFrame) > 600) { rtPortSMGiveUp(&g_rtPortSM[i]); m = &g_rtPortSM[i]; }
     if (!m) return NULL;
     if (!m->mem) m->mem = (BYTE*)VirtualAlloc(NULL, 256 * 256 * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!g_rtPortSMTmp) g_rtPortSMTmp = (BYTE*)VirtualAlloc(NULL, 256 * 256 * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!m->mem || !g_rtPortSMTmp) return NULL;
+    if (!m->tmp) m->tmp = (BYTE*)VirtualAlloc(NULL, 256 * 256 * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!m->mem || !m->tmp) return NULL;
     struct { INT pitch; void* bits; } lr = { 0, NULL };
     rtDrain(); rtExecLock(); g_rtDirectScope++;                                                       // the one real read: after everything queued, with the device to ourselves
+    // Only a surface of its own: a level of a texture can also be written through the texture (LockRect, UnlockRect,
+    // dirty rectangles, UpdateTexture), which the copy would not see.
+    static const GUID kBaseTex = {0x580CA87E, 0x1D3C, 0x4D54, {0x99, 0x1D, 0xB7, 0xD3, 0xE3, 0xC2, 0x98, 0xCE}};       // IID_IDirect3DBaseTexture9
+    void* cont = NULL;
+    if ((LONG)((DWORD(__stdcall*)(void*, const GUID*, void**))g_rtO_surf[11])(self, &kBaseTex, &cont) >= 0 && cont) {
+        ((DWORD(__stdcall*)(void*))(*(void***)cont)[2])(cont);
+        g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
+        g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; return NULL;
+    }
     LONG hr = (LONG)((DWORD(__stdcall*)(void*, void*, void*, DWORD))g_rtO_surf[13])(self, &lr, NULL, 0x10);
     if (hr >= 0 && lr.bits) for (DWORD y = 0; y < h; ++y) memcpy(m->mem + y * w * 4, (BYTE*)lr.bits + (INT)y * lr.pitch, w * 4);
     if (hr >= 0) ((DWORD(__stdcall*)(void*))g_rtO_surf[14])(self);
     g_rtDirectScope--; LeaveCriticalSection(&g_rtExecCs);
     if (hr < 0 || !lr.bits) { g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; return NULL; }
     ((DWORD(__stdcall*)(void*))g_rtO_surf[1])(self);                                                  // AddRef: kept while the copy lives
-    m->surf = s; m->w = w; m->h = h; m->locked = 0; m->write = 0; m->lastFrame = g_mkFrames; m->live = 1; g_rtPortSMAny = 1; g_rtPortSMAdopt++;
+    m->surf = s; m->w = w; m->h = h; m->locked = 0; m->write = 0; m->stale = 0; m->lastFrame = g_mkFrames; m->live = 1; g_rtPortSMAny = 1; g_rtPortSMAdopt++;
     return m;
 }
 static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flags, DWORD* ret) {
@@ -353,6 +373,7 @@ static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flag
     DWORD s = (DWORD)(ULONG_PTR)self;
     if (g_rtActive && __readfsdword(0x24) == g_rtMainTid && !g_rtDirectScope) {
         RtPortSM* m = pLocked ? rtPortSMFind(s) : NULL;
+        if (m && m->stale && !m->locked) { rtPortSMGiveUp(m); m = NULL; }                             // written some other way since: start again from the real pixels
         if (!m && pLocked) m = rtPortSMAdoptSurf(self);
         if (m) {
             if (m->locked) { *ret = 0x8876086Cu; return true; }                                      // D3DERR_INVALIDCALL: it is locked already
@@ -366,10 +387,7 @@ static bool rtPortSurfLockTry(void* self, DWORD pLocked, DWORD pRect, DWORD flag
             }
             rtPortSMGiveUp(m);                                                                        // a rectangle outside it: not for the copy
         }
-    } else if (g_rtPortSMAny) {                                                                       // locked some other way: what the copy holds is no longer the truth
-        RtPortSM* m = rtPortSMFind(s);
-        if (m && !m->locked) { m->live = 0; g_rtPortSMDrop++; g_rtPortSMNo[g_rtPortSMNoI++ & 31] = s; }   // (its reference stays: rare, and a release here would not be in order)
-    }
+    } else if (g_rtPortSMAny) rtPortSMTouched(s);                                                    // locked some other way (D3DX, another thread)
     return false;
 }
 static bool rtPortSurfUnlockTry(void* self) {
@@ -379,11 +397,13 @@ static bool rtPortSurfUnlockTry(void* self) {
     m->locked = 0;
     if (m->write) {
         DWORD w = m->r - m->l, h = m->b - m->t, row = w * 4, bytes = row * h;
-        for (DWORD y = 0; y < h; ++y) memcpy(g_rtPortSMTmp + y * row, m->mem + ((m->t + y) * m->w + m->l) * 4, row);
-        RtRec* rec = rtAlloc(9, bytes); rec->kind = 7; rec->op = 304;
+        DWORD ml = m->l, mt = m->t, mr = m->r, mb = m->b;
+        RtRec* rec = rtAlloc(9, bytes); rec->kind = 7; rec->op = 304;                                 // (may wait for the queue: the rows are gathered after it)
+        const BYTE* src = m->mem + (mt * m->w + ml) * 4;
+        if (w != m->w) { for (DWORD y = 0; y < h; ++y) memcpy(m->tmp + y * row, m->mem + ((mt + y) * m->w + ml) * 4, row); src = m->tmp; }
         DWORD* A = rtArgs(rec); BYTE* P = rtPayload(rec); DWORD po = 0;
-        A[0] = m->surf; A[1] = m->l; A[2] = m->t; A[3] = m->r; A[4] = m->b; A[5] = 4;
-        A[6] = rtBytes(P, &po, (DWORD)(ULONG_PTR)g_rtPortSMTmp, bytes);
+        A[0] = m->surf; A[1] = ml; A[2] = mt; A[3] = mr; A[4] = mb; A[5] = 4;
+        A[6] = rtBytes(P, &po, (DWORD)(ULONG_PTR)src, bytes);
         A[7] = (DWORD)(ULONG_PTR)g_rtO_surf[13]; A[8] = (DWORD)(ULONG_PTR)g_rtO_surf[14];
         rtTouch(m->surf); rtCommit(rec, po);
     }
@@ -623,6 +643,9 @@ static DWORD WINAPI rtPortMonitor(LPVOID) {
     }
     return 0;
 }
+// The proxy underneath wants to know, on the game's thread, when the game has finished a frame (its Present hook
+// runs on the worker and later). The accelerator already calls g_rtFrameTick from its Present hooks for that.
+extern "C" __declspec(dllexport) void __cdecl RtPortSetFrameTick(void (__cdecl* fn)()) { g_rtFrameTick = fn; }
 static DWORD WINAPI rtPortInit(LPVOID) {
     logf("renderthread.dll loaded (carve-out of BFME2 Accelerator's render thread).");
     rtInit();
